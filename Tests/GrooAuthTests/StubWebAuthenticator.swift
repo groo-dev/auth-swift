@@ -16,11 +16,18 @@ final class StubWebAuthenticator: WebAuthenticating, @unchecked Sendable {
 
     private let result: Result
 
+    /// Captures the last `authenticate` call so Task 7's tests can assert on the
+    /// authorization URL `signIn` builds (client_id, PKCE challenge, state, nonce, ...).
+    private(set) var lastURL: URL?
+    private(set) var lastCallbackScheme: String?
+
     init(result: Result = .failure(GrooAuthError.userCancelled)) {
         self.result = result
     }
 
     func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor?) async throws -> URL {
+        lastURL = url
+        lastCallbackScheme = callbackScheme
         switch result {
         case .success(let url): return url
         case .failure(let error): throw error
