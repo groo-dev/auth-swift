@@ -223,4 +223,145 @@ final class SignInTests: XCTestCase {
         let afterSignIn = await iterator.next()
         XCTAssertEqual(afterSignIn, .signedIn(user), "signIn success must publish .signedIn on the state stream")
     }
+
+    // MARK: - (e) Unknown-kid JWKS self-heal (IdP key rotation)
+
+    /// Signs `claims` with a fresh ES256 key under `kid` and returns the JWT plus
+    /// the matching JWKS body — same recipe as `makeJWTAndJWKS` but standalone so
+    /// tests can build multiple, independently-keyed JWKS bodies (e.g. a "stale"
+    /// one and a "fresh" one) to simulate an IdP key rotation.
+    private func makeJWKSBody(kid: String) -> String {
+        let key = P256.Signing.PrivateKey()
+        func b64(_ d: Data) -> String { PKCE.base64URL(d) }
+        let pub = key.publicKey.x963Representation
+        let x = pub.subdata(in: 1..<33), y = pub.subdata(in: 33..<65)
+        return #"{"keys":[{"kty":"EC","crv":"P-256","x":"\#(b64(x))","y":"\#(b64(y))","kid":"\#(kid)","alg":"ES256"}]}"#
+    }
+
+    func testUnknownKidTriggersExactlyOneJWKSRefetchThenSucceeds() async throws {
+        let store = InMemoryTokenStore()
+        let exp = Date().addingTimeInterval(600).timeIntervalSince1970
+        // The id_token is signed with "fresh-key" — a kid that only shows up in
+        // the JWKS fetched the *second* time (simulating the IdP having rotated
+        // keys since this session's first, now-stale, JWKS fetch).
+        let (jwt, freshJWKSBody) = try makeJWTAndJWKS(claims: [
+            "sub": "user-1",
+            "aud": "test-client",
+            "iss": "https://accounts.groo.dev",
+            "exp": exp,
+            "nonce": expectedNonce,
+        ], kid: "fresh-key")
+        let staleJWKSBody = makeJWKSBody(kid: "stale-key")
+
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (200, #"""
+            {"access_token":"at1","refresh_token":"rt1","token_type":"Bearer","expires_in":900,"id_token":"\#(jwt)"}
+            """#),
+        ])
+        transport.setSequence(for: jwksURL, responses: [
+            (200, staleJWKSBody),
+            (200, freshJWKSBody),
+        ])
+        let callback = URL(string: "dev.groo.test://oauth-callback?code=abc&state=\(expectedState)")!
+        let stub = StubWebAuthenticator(result: .success(callback))
+        let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
+
+        let user = try await session.signIn(presentationAnchor: await makeTestAnchor())
+
+        XCTAssertEqual(user.sub, "user-1")
+        XCTAssertEqual(transport.callCount(for: jwksURL), 2, "an unknown kid must trigger exactly one JWKS re-fetch")
+
+        let stored = try store.load()
+        XCTAssertEqual(stored?.idToken, jwt)
+    }
+
+    func testKidUnknownInBothStaleAndFreshJWKSThrowsWithoutLooping() async throws {
+        let store = InMemoryTokenStore()
+        let exp = Date().addingTimeInterval(600).timeIntervalSince1970
+        // Signed under a kid that never shows up in either JWKS fetch.
+        let (jwt, _) = try makeJWTAndJWKS(claims: [
+            "sub": "user-1",
+            "aud": "test-client",
+            "iss": "https://accounts.groo.dev",
+            "exp": exp,
+            "nonce": expectedNonce,
+        ], kid: "totally-unknown-key")
+        let staleJWKSBody = makeJWKSBody(kid: "stale-key")
+        let freshJWKSBody = makeJWKSBody(kid: "fresh-key")
+
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (200, #"""
+            {"access_token":"at1","refresh_token":"rt1","token_type":"Bearer","expires_in":900,"id_token":"\#(jwt)"}
+            """#),
+        ])
+        transport.setSequence(for: jwksURL, responses: [
+            (200, staleJWKSBody),
+            (200, freshJWKSBody),
+        ])
+        let callback = URL(string: "dev.groo.test://oauth-callback?code=abc&state=\(expectedState)")!
+        let stub = StubWebAuthenticator(result: .success(callback))
+        let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
+
+        do {
+            _ = try await session.signIn(presentationAnchor: await makeTestAnchor())
+            XCTFail("expected idTokenInvalid: kid absent from both JWKS fetches")
+        } catch GrooAuthError.idTokenInvalid {
+            // expected
+        }
+
+        XCTAssertEqual(
+            transport.callCount(for: jwksURL), 2,
+            "must re-fetch exactly once (not loop) when the kid is still unknown after the re-fetch"
+        )
+        XCTAssertNil(try store.load(), "a failed verification must not store any tokens")
+    }
+
+    func testTamperedSignatureDoesNotTriggerJWKSRefetch() async throws {
+        let store = InMemoryTokenStore()
+        let exp = Date().addingTimeInterval(600).timeIntervalSince1970
+        let (jwt, jwksBody) = try makeJWTAndJWKS(claims: [
+            "sub": "user-1",
+            "aud": "test-client",
+            "iss": "https://accounts.groo.dev",
+            "exp": exp,
+            "nonce": expectedNonce,
+        ])
+
+        // Flip a bit in the middle of the signature so it's well-formed (right
+        // length, valid base64url) but cryptographically invalid — the kid is
+        // still present and matches a JWK, so this must be rejected as a bad
+        // signature, not treated as an unknown-kid situation.
+        let parts = jwt.split(separator: ".")
+        XCTAssertEqual(parts.count, 3)
+        guard var sigBytes = base64URLDecode(String(parts[2])) else {
+            return XCTFail("failed to decode signature under test")
+        }
+        sigBytes[sigBytes.count / 2] ^= 0xFF
+        let tamperedJWT = "\(parts[0]).\(parts[1]).\(PKCE.base64URL(sigBytes))"
+
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (200, #"""
+            {"access_token":"at1","refresh_token":"rt1","token_type":"Bearer","expires_in":900,"id_token":"\#(tamperedJWT)"}
+            """#),
+            jwksURL: (200, jwksBody),
+        ])
+        let callback = URL(string: "dev.groo.test://oauth-callback?code=abc&state=\(expectedState)")!
+        let stub = StubWebAuthenticator(result: .success(callback))
+        let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
+
+        do {
+            _ = try await session.signIn(presentationAnchor: await makeTestAnchor())
+            XCTFail("expected idTokenInvalid: tampered signature")
+        } catch GrooAuthError.idTokenInvalid {
+            // expected
+        }
+
+        XCTAssertEqual(
+            transport.callCount(for: jwksURL), 1,
+            "a bad signature (not an unknown kid) must not trigger a JWKS re-fetch"
+        )
+    }
 }

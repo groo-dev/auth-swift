@@ -1,6 +1,30 @@
 import XCTest
 @testable import GrooAuth
 
+/// `TokenStoring` test double whose `load()` always throws — simulates a
+/// genuine Keychain read failure (as opposed to a legitimate "no tokens
+/// stored" `nil`), so `signOut()` can be tested for the case where it cannot
+/// know whether there was a refresh token to revoke.
+private final class ThrowingLoadTokenStore: TokenStoring, @unchecked Sendable {
+    struct LoadFailure: Error, CustomStringConvertible {
+        var description: String { "simulated keychain read failure" }
+    }
+
+    private(set) var clearCallCount = 0
+
+    func load() throws -> StoredTokens? {
+        throw LoadFailure()
+    }
+
+    func save(_ tokens: StoredTokens) throws {
+        XCTFail("save() should never be called by signOut()")
+    }
+
+    func clear() throws {
+        clearCallCount += 1
+    }
+}
+
 final class SignOutTests: XCTestCase {
     private let testConfig = GrooAuthConfig(
         issuer: URL(string: "https://accounts.groo.dev")!,
@@ -73,6 +97,33 @@ final class SignOutTests: XCTestCase {
         XCTAssertTrue(reason.contains("500"), "reason should mention the HTTP failure: \(reason)")
 
         XCTAssertNil(try store.load(), "signOut must clear local tokens even when revoke fails")
+
+        let state = await session.currentState()
+        XCTAssertEqual(state, .signedOut)
+    }
+
+    func testSignOutSurfacesLoadFailureInsteadOfClaimingRevocation() async throws {
+        let store = ThrowingLoadTokenStore()
+        // No routes configured: a load failure must short-circuit before any
+        // revoke attempt, since there's no refresh token to send.
+        let transport = MockTransport(routes: [:])
+        let session = GrooAuthSession(
+            config: testConfig, tokenStore: store, transport: transport,
+            webAuthenticator: StubWebAuthenticator(), now: { Date() }
+        )
+
+        let result = await session.signOut()
+
+        guard case .clearedButRevokeFailed(let reason) = result else {
+            XCTFail("a load() throw must never be reported as .revokedAndCleared — got \(result)")
+            return
+        }
+        XCTAssertTrue(
+            reason.contains("simulated keychain read failure"),
+            "reason should mention the real load failure: \(reason)"
+        )
+        XCTAssertEqual(transport.totalCallCount, 0, "no refresh token was readable, so nothing should be revoked")
+        XCTAssertEqual(store.clearCallCount, 1, "local state must still be cleared despite the load failure")
 
         let state = await session.currentState()
         XCTAssertEqual(state, .signedOut)

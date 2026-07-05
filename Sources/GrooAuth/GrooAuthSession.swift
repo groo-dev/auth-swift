@@ -50,9 +50,10 @@ public actor GrooAuthSession {
     /// Fixed PKCE verifier/state/nonce for tests (`nil` in production — see `PKCEOverride`).
     private let pkceOverride: PKCEOverride?
 
-    /// Subscribers to `stateStream`. Each subscription gets its own continuation;
+    /// Subscribers to `stateStream`, keyed so a dropped subscriber's continuation
+    /// can be pruned individually (see `stateStream`'s `onTermination`).
     /// `publish` fans a state change out to all of them.
-    private var stateContinuations: [AsyncStream<GrooAuthState>.Continuation] = []
+    private var stateContinuations: [UUID: AsyncStream<GrooAuthState>.Continuation] = [:]
 
     public init(
         config: GrooAuthConfig,
@@ -118,17 +119,37 @@ public actor GrooAuthSession {
     /// `.signedIn`; refresh rejection and sign-out emit `.signedOut`. A new
     /// subscriber immediately receives the current state, then subsequent changes.
     public var stateStream: AsyncStream<GrooAuthState> {
+        let id = UUID()
         var continuation: AsyncStream<GrooAuthState>.Continuation!
         let stream = AsyncStream<GrooAuthState> { continuation = $0 }
         continuation.yield(computeCurrentState())
-        stateContinuations.append(continuation)
+        stateContinuations[id] = continuation
+        // Without this, every subscriber that stops iterating (view disappears,
+        // task cancelled, stream simply dropped) leaves its continuation in
+        // `stateContinuations` forever — an unbounded leak for the actor's
+        // lifetime. Pruning here keeps the dictionary sized to actual live
+        // subscribers.
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeContinuation(id) }
+        }
         return stream
     }
 
+    private func removeContinuation(_ id: UUID) {
+        stateContinuations.removeValue(forKey: id)
+    }
+
     private func publish(_ state: GrooAuthState) {
-        for continuation in stateContinuations {
+        for continuation in stateContinuations.values {
             continuation.yield(state)
         }
+    }
+
+    /// Test-only introspection into subscriber count — not part of the public
+    /// API. Lets tests assert that a dropped `stateStream` subscriber is
+    /// actually pruned rather than leaking (see `removeContinuation`).
+    func stateContinuationCountForTesting() -> Int {
+        stateContinuations.count
     }
 
     /// Returns a valid access token, refreshing first if the cached one is expired
@@ -292,15 +313,7 @@ public actor GrooAuthSession {
             throw GrooAuthError.invalidResponse("token response missing id_token")
         }
 
-        let jwksDoc = try await loadJWKS(doc)
-        let claims = try verifyIDToken(
-            idToken,
-            jwks: jwksDoc,
-            issuer: config.issuer.absoluteString,
-            clientId: config.clientId,
-            nonce: nonce,
-            now: now()
-        )
+        let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
         let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
 
         let stored = StoredTokens(
@@ -317,6 +330,54 @@ public actor GrooAuthSession {
         return user
     }
 
+    /// Verifies `idToken` against the cached JWKS, self-healing exactly once if
+    /// verification fails specifically because the token's `kid` isn't in the
+    /// cached JWKS (`IDTokenFailure.unknownKid`) — the IdP may have rotated its
+    /// signing keys since this session's JWKS was cached, and a NEW sign-in's
+    /// `id_token` will carry the new `kid`. On that specific failure, forces one
+    /// cache-bypassing JWKS re-fetch and retries verification exactly once with
+    /// the fresh JWKS; if it still fails (kid still absent, or now some other
+    /// check fails) the failure propagates — never loops beyond one re-fetch.
+    ///
+    /// Any other verification failure (bad signature, wrong `aud`/`iss`, expired,
+    /// bad nonce) is not a JWKS-cache problem and propagates immediately without
+    /// re-fetching — re-fetching couldn't fix those regardless of which keys are
+    /// cached, so retrying would just mask the real rejection behind an extra
+    /// network round-trip.
+    private func verifyIDTokenSelfHealing(
+        _ idToken: String,
+        doc: DiscoveryDocument,
+        nonce: String
+    ) async throws -> IDTokenClaims {
+        let jwksDoc = try await loadJWKS(doc)
+        do {
+            return try verifyIDTokenCore(
+                idToken,
+                jwks: jwksDoc,
+                issuer: config.issuer.absoluteString,
+                clientId: config.clientId,
+                nonce: nonce,
+                now: now()
+            )
+        } catch IDTokenFailure.unknownKid {
+            let freshJWKS = try await loadJWKS(doc, forceRefresh: true)
+            do {
+                return try verifyIDTokenCore(
+                    idToken,
+                    jwks: freshJWKS,
+                    issuer: config.issuer.absoluteString,
+                    clientId: config.clientId,
+                    nonce: nonce,
+                    now: now()
+                )
+            } catch let failure as IDTokenFailure {
+                throw failure.asGrooAuthError
+            }
+        } catch let failure as IDTokenFailure {
+            throw failure.asGrooAuthError
+        }
+    }
+
     // MARK: - Sign-out
 
     /// Signs out locally and, if possible, revokes the refresh-token family
@@ -327,11 +388,24 @@ public actor GrooAuthSession {
     /// only way a caller learns the revoke attempt failed is via the returned
     /// `.clearedButRevokeFailed(reason:)`, whose `reason` names the real failure
     /// (HTTP status or underlying error) rather than swallowing it.
+    ///
+    /// A `tokenStore.load()` throw is distinguished from a genuine "no tokens
+    /// stored": the former means we cannot know whether there's a refresh token
+    /// to revoke, so it is reported as `.clearedButRevokeFailed` (never silently
+    /// upgraded to `.revokedAndCleared`, which would misreport a revoke that
+    /// never happened). Only a real nil (no error, no tokens) keeps the
+    /// "nothing to revoke" `.revokedAndCleared` outcome.
     public func signOut() async -> SignOutResult {
-        let tokens = (try? tokenStore.load()) ?? nil
+        let loaded: StoredTokens?
         var revokeFailureReason: String?
+        do {
+            loaded = try tokenStore.load()
+        } catch {
+            loaded = nil
+            revokeFailureReason = "could not read stored tokens to revoke: \(error)"
+        }
 
-        if let tokens, !tokens.refreshToken.isEmpty {
+        if let tokens = loaded, !tokens.refreshToken.isEmpty {
             do {
                 let doc = try await loadDiscovery()
                 if let revocationEndpoint = doc.revocationEndpoint {
@@ -410,8 +484,11 @@ public actor GrooAuthSession {
     }
 
     /// Fetches and caches the JWKS from the discovery document's `jwks_uri`.
-    private func loadJWKS(_ doc: DiscoveryDocument) async throws -> JWKS {
-        if let jwks { return jwks }
+    /// `forceRefresh` bypasses the cache and re-fetches even if a value is
+    /// already cached — used by `verifyIDTokenSelfHealing` to get fresh keys
+    /// after an unknown-`kid` failure (e.g. the IdP rotated signing keys).
+    private func loadJWKS(_ doc: DiscoveryDocument, forceRefresh: Bool = false) async throws -> JWKS {
+        if !forceRefresh, let jwks { return jwks }
         let (data, response) = try await transport.send(URLRequest(url: doc.jwksURI))
         guard response.statusCode == 200 else {
             throw GrooAuthError.invalidResponse("jwks HTTP \(response.statusCode)")

@@ -16,6 +16,12 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
     }
 
     private var routes: [String: Response]
+    /// Per-URL queues of responses that take priority over `routes`, popped one
+    /// per call in order (falling back to `routes` once exhausted). Lets tests
+    /// simulate an endpoint's response changing across repeated fetches — e.g.
+    /// stale JWKS on the first fetch and fresh JWKS (post key-rotation) on the
+    /// second — without needing a full request-sequencing overhaul.
+    private var sequences: [String: [Response]] = [:]
     private(set) var calls: [String] = []
     /// Last request body seen per URL (e.g. the form-encoded POST body), keyed the
     /// same way as `routes`/`calls`. Lets tests assert on what was actually sent
@@ -27,6 +33,13 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
         self.routes = routes.mapValues { Response(status: $0.status, body: $0.body) }
     }
 
+    /// Queues `responses` for `urlString`, each call to that URL popping the
+    /// next one in order. Once the queue is exhausted, subsequent calls fall
+    /// back to the static entry in `routes` (if any).
+    func setSequence(for urlString: String, responses: [(status: Int, body: String)]) {
+        sequences[urlString] = responses.map { Response(status: $0.status, body: $0.body) }
+    }
+
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         guard let url = request.url else {
             throw GrooAuthError.transport("MockTransport: request has no URL")
@@ -36,7 +49,13 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
         if let body = request.httpBody {
             lastBodies[key] = body
         }
-        guard let route = routes[key] else {
+        let route: Response
+        if var queued = sequences[key], !queued.isEmpty {
+            route = queued.removeFirst()
+            sequences[key] = queued
+        } else if let fixed = routes[key] {
+            route = fixed
+        } else {
             throw GrooAuthError.transport("MockTransport: no route mapped for \(key)")
         }
         let data = Data(route.body.utf8)
