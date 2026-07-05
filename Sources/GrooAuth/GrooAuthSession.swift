@@ -133,6 +133,21 @@ public actor GrooAuthSession {
         return refreshed.accessToken
     }
 
+    /// Forces a token refresh regardless of the cached token's expiry, then
+    /// returns the refreshed access token. Callers use this after a request
+    /// comes back `401` despite `accessToken()` having handed out what looked
+    /// like a still-valid token (e.g. the token was revoked server-side).
+    /// Single-flight, same as `accessToken()`'s own refresh path. Throws
+    /// `.signedOut` if there's no session left, or if the refresh token
+    /// itself is rejected (which also publishes `.signedOut` on `stateStream`).
+    public func forceRefreshAccessToken() async throws -> String {
+        try await refresh()
+        guard let refreshed = try tokenStore.load() else {
+            throw GrooAuthError.signedOut
+        }
+        return refreshed.accessToken
+    }
+
     // MARK: - Single-flight refresh
 
     /// Refreshes the access token using the stored refresh token.
