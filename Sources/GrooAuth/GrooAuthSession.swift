@@ -288,6 +288,61 @@ public actor GrooAuthSession {
         return user
     }
 
+    // MARK: - Sign-out
+
+    /// Signs out locally and, if possible, revokes the refresh-token family
+    /// server-side (RFC 7009) so a leaked/cached token can't be replayed later.
+    ///
+    /// Never throws — whatever happens with the revoke attempt, local tokens are
+    /// always cleared and `.signedOut` is always published to `stateStream`. The
+    /// only way a caller learns the revoke attempt failed is via the returned
+    /// `.clearedButRevokeFailed(reason:)`, whose `reason` names the real failure
+    /// (HTTP status or underlying error) rather than swallowing it.
+    public func signOut() async -> SignOutResult {
+        let tokens = (try? tokenStore.load()) ?? nil
+        var revokeFailureReason: String?
+
+        if let tokens, !tokens.refreshToken.isEmpty {
+            do {
+                let doc = try await loadDiscovery()
+                if let revocationEndpoint = doc.revocationEndpoint {
+                    do {
+                        let (_, response) = try await postForm(
+                            url: revocationEndpoint,
+                            parameters: ["token": tokens.refreshToken, "client_id": config.clientId]
+                        )
+                        if response.statusCode != 200 {
+                            revokeFailureReason = "revocation endpoint returned HTTP \(response.statusCode)"
+                        }
+                    } catch {
+                        revokeFailureReason = "revocation request failed: \(error)"
+                    }
+                }
+                // else: server advertises no revocation_endpoint — nothing to revoke.
+            } catch {
+                revokeFailureReason = "failed to load discovery for revocation: \(error)"
+            }
+        }
+
+        do {
+            try tokenStore.clear()
+        } catch {
+            // Clearing failed too — the most serious outcome. Still publish
+            // .signedOut (the app-visible state is "signed out" either way) and
+            // surface both failures in the reason rather than losing one.
+            publish(.signedOut)
+            let clearFailure = "failed to clear local tokens: \(error)"
+            let reason = revokeFailureReason.map { "\($0); \(clearFailure)" } ?? clearFailure
+            return .clearedButRevokeFailed(reason: reason)
+        }
+
+        publish(.signedOut)
+        if let revokeFailureReason {
+            return .clearedButRevokeFailed(reason: revokeFailureReason)
+        }
+        return .revokedAndCleared
+    }
+
     // MARK: - Token exchange (shared by refresh + signIn)
 
     /// POSTs a form-encoded grant request to the discovery-provided token endpoint
@@ -295,12 +350,7 @@ public actor GrooAuthSession {
     /// and `grant_type=authorization_code` (`signIn`).
     func requestToken(parameters: [String: String]) async throws -> TokenResponse {
         let doc = try await loadDiscovery()
-        var request = URLRequest(url: doc.tokenEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Self.formEncode(parameters)
-
-        let (data, response) = try await transport.send(request)
+        let (data, response) = try await postForm(url: doc.tokenEndpoint, parameters: parameters)
         guard response.statusCode == 200 else {
             let protocolError = try OAuthProtocolError.decode(data)
             throw GrooAuthError.protocolError(protocolError)
@@ -310,6 +360,17 @@ public actor GrooAuthSession {
         } catch {
             throw GrooAuthError.invalidResponse("token response missing/invalid field: \(error)")
         }
+    }
+
+    /// POSTs a form-encoded body to `url` via the shared transport and returns the
+    /// raw response. Shared plumbing for the token endpoint (`requestToken`) and
+    /// the revocation endpoint (`signOut`).
+    private func postForm(url: URL, parameters: [String: String]) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Self.formEncode(parameters)
+        return try await transport.send(request)
     }
 
     private func loadDiscovery() async throws -> DiscoveryDocument {

@@ -17,6 +17,11 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
 
     private var routes: [String: Response]
     private(set) var calls: [String] = []
+    /// Last request body seen per URL (e.g. the form-encoded POST body), keyed the
+    /// same way as `routes`/`calls`. Lets tests assert on what was actually sent
+    /// (e.g. that a revoke POST carried the refresh token) without needing a
+    /// full request-capturing overhaul.
+    private(set) var lastBodies: [String: Data] = [:]
 
     init(routes: [String: (status: Int, body: String)]) {
         self.routes = routes.mapValues { Response(status: $0.status, body: $0.body) }
@@ -28,6 +33,9 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
         }
         let key = url.absoluteString
         calls.append(key)
+        if let body = request.httpBody {
+            lastBodies[key] = body
+        }
         guard let route = routes[key] else {
             throw GrooAuthError.transport("MockTransport: no route mapped for \(key)")
         }
@@ -50,4 +58,9 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
 
     /// Total number of requests seen across all routes.
     var totalCallCount: Int { calls.count }
+
+    /// The last request body sent to `urlString`, if any request was made to it.
+    func lastRequestBody(for urlString: String) -> Data? {
+        lastBodies[urlString]
+    }
 }
