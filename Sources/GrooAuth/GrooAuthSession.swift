@@ -156,11 +156,14 @@ public actor GrooAuthSession {
     /// (or within 60s of expiry). Throws `.signedOut` if there are no stored tokens.
     public func accessToken() async throws -> String {
         guard let tokens = try tokenStore.load() else {
+            GrooAuthLog.signin.notice("accessToken: no stored tokens, signedOut")
             throw GrooAuthError.signedOut
         }
         if tokens.expiresAt.timeIntervalSince(now()) > 60 {
+            GrooAuthLog.signin.notice("accessToken: cache hit")
             return tokens.accessToken
         }
+        GrooAuthLog.signin.notice("accessToken: cache expired, refreshing")
         try await refresh()
         guard let refreshed = try tokenStore.load() else {
             throw GrooAuthError.signedOut
@@ -206,7 +209,9 @@ public actor GrooAuthSession {
     }
 
     private func performRefresh() async throws {
+        GrooAuthLog.signin.notice("performRefresh: start")
         guard let tokens = try tokenStore.load() else {
+            GrooAuthLog.signin.notice("performRefresh: no stored tokens, signedOut")
             throw GrooAuthError.signedOut
         }
         do {
@@ -228,6 +233,7 @@ public actor GrooAuthSession {
             if let user = stored.user {
                 publish(.signedIn(user))
             }
+            GrooAuthLog.signin.notice("performRefresh: done, outcome=success")
         } catch let error as GrooAuthError {
             if case .protocolError = error {
                 // Refresh token was rejected outright (e.g. invalid_grant / revoked).
@@ -235,6 +241,7 @@ public actor GrooAuthSession {
                 try? tokenStore.clear()
                 publish(.signedOut)
             }
+            GrooAuthLog.signin.error("performRefresh: done, outcome=failed error=\(String(describing: error), privacy: .public)")
             throw error
         }
     }
@@ -249,85 +256,136 @@ public actor GrooAuthSession {
     /// exchange, or a failed `id_token` verification all leave the token store
     /// untouched.
     public func signIn(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
-        let verifier: String
-        let state: String
-        let nonce: String
-        if let pkceOverride {
-            verifier = pkceOverride.verifier
-            state = pkceOverride.state
-            nonce = pkceOverride.nonce
-        } else {
-            verifier = PKCE.generateVerifier()
-            state = PKCE.randomURLSafe(byteCount: 16)
-            nonce = PKCE.randomURLSafe(byteCount: 16)
+        // `step` always names the last step *entered* (updated before each
+        // stage), so the catch block below can log exactly where signIn
+        // failed even though the throw sites are scattered — this makes the
+        // final `signin.error` line answer "which step was last to log
+        // before failure/crash" without needing a log line at every throw.
+        var step = "start"
+        GrooAuthLog.signin.notice("signIn: start")
+        do {
+            let verifier: String
+            let state: String
+            let nonce: String
+            if let pkceOverride {
+                verifier = pkceOverride.verifier
+                state = pkceOverride.state
+                nonce = pkceOverride.nonce
+            } else {
+                verifier = PKCE.generateVerifier()
+                state = PKCE.randomURLSafe(byteCount: 16)
+                nonce = PKCE.randomURLSafe(byteCount: 16)
+            }
+            let challenge = PKCE.challenge(for: verifier)
+            step = "pkce+state+nonce generated"
+            // Never log verifier/nonce (nonce round-trips inside the signed id_token,
+            // so logging it would let a log reader forge a matching assertion). state
+            // is safe: it's a one-shot anti-CSRF value, not a long-term secret.
+            GrooAuthLog.signin.notice("signIn: pkce+state+nonce generated state=\(state, privacy: .public)")
+
+            step = "loadDiscovery"
+            GrooAuthLog.signin.notice("signIn: loadDiscovery start")
+            let doc = try await loadDiscovery()
+            GrooAuthLog.signin.notice("signIn: loadDiscovery done authorizationEndpointHost=\(doc.authorizationEndpoint.host ?? "nil", privacy: .public)")
+
+            step = "build authorize URL"
+            guard var components = URLComponents(url: doc.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
+                throw GrooAuthError.invalidResponse("authorization_endpoint is not a valid URL: \(doc.authorizationEndpoint)")
+            }
+            components.queryItems = [
+                URLQueryItem(name: "response_type", value: "code"),
+                URLQueryItem(name: "client_id", value: config.clientId),
+                URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+                URLQueryItem(name: "scope", value: config.scopeString),
+                URLQueryItem(name: "state", value: state),
+                URLQueryItem(name: "nonce", value: nonce),
+                URLQueryItem(name: "code_challenge", value: challenge),
+                URLQueryItem(name: "code_challenge_method", value: "S256"),
+            ]
+            guard let authorizeURL = components.url else {
+                throw GrooAuthError.invalidResponse("failed to construct authorization URL")
+            }
+            step = "authorize URL built"
+            // No secret in this URL: code_challenge is a one-way hash of the verifier.
+            GrooAuthLog.signin.notice("signIn: authorize URL built url=\(authorizeURL.absoluteString, privacy: .public)")
+
+            step = "calling webAuthenticator.authenticate"
+            GrooAuthLog.signin.notice("signIn: calling webAuthenticator.authenticate")
+            let callbackURL = try await webAuthenticator.authenticate(
+                url: authorizeURL,
+                callbackScheme: config.callbackScheme,
+                anchor: presentationAnchor
+            )
+
+            let callbackItems = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            func value(_ name: String) -> String? { callbackItems.first(where: { $0.name == name })?.value }
+            let hasCodeInCallback = value("code") != nil
+            step = "callback returned"
+            GrooAuthLog.signin.notice("signIn: callback returned scheme=\(callbackURL.scheme ?? "nil", privacy: .public) host=\(callbackURL.host ?? "nil", privacy: .public) hasCode=\(hasCodeInCallback, privacy: .public)")
+
+            step = "check callback error param"
+            if let callbackError = value("error") {
+                throw GrooAuthError.protocolError(OAuthProtocolError(error: callbackError, errorDescription: value("error_description")))
+            }
+            step = "verify state"
+            guard let returnedState = value("state"), returnedState == state else {
+                GrooAuthLog.signin.error("signIn: state mismatch expected=\(state, privacy: .public) got=\(value("state") ?? "nil", privacy: .public)")
+                throw GrooAuthError.stateMismatch
+            }
+            GrooAuthLog.signin.notice("signIn: state verified")
+            step = "extract code"
+            guard let code = value("code") else {
+                throw GrooAuthError.invalidResponse("callback URL is missing code")
+            }
+
+            step = "token exchange"
+            GrooAuthLog.signin.notice("signIn: token exchange start")
+            let response = try await requestToken(parameters: [
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": config.redirectURI,
+                "client_id": config.clientId,
+                "code_verifier": verifier,
+            ])
+            step = "token exchange done"
+            GrooAuthLog.signin.notice("signIn: token exchange done")
+
+            step = "check id_token presence"
+            guard let idToken = response.id_token else {
+                throw GrooAuthError.invalidResponse("token response missing id_token")
+            }
+
+            step = "id_token verify"
+            GrooAuthLog.signin.notice("signIn: id_token verify start")
+            let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
+            step = "id_token verified"
+            // Claims are fine to log (post-verification, non-secret); the raw JWT never is.
+            GrooAuthLog.signin.notice("signIn: id_token verified sub=\(claims.sub, privacy: .public) iss=\(claims.iss, privacy: .public) aud=\(claims.aud, privacy: .public) exp=\(claims.exp, privacy: .public)")
+            let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
+
+            step = "building StoredTokens"
+            let stored = StoredTokens(
+                accessToken: response.access_token,
+                refreshToken: response.refresh_token,
+                tokenType: response.token_type,
+                expiresAt: now().addingTimeInterval(TimeInterval(response.expires_in)),
+                idToken: idToken,
+                scope: response.scope,
+                user: user
+            )
+            step = "tokenStore.save"
+            GrooAuthLog.signin.notice("signIn: tokenStore.save start")
+            try tokenStore.save(stored)
+            GrooAuthLog.signin.notice("signIn: tokenStore.save done")
+
+            step = "publish signedIn"
+            publish(.signedIn(user))
+            GrooAuthLog.signin.notice("signIn: published signedIn, returning user")
+            return user
+        } catch {
+            GrooAuthLog.signin.error("signIn FAILED at step=\(step, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw error
         }
-        let challenge = PKCE.challenge(for: verifier)
-
-        let doc = try await loadDiscovery()
-
-        guard var components = URLComponents(url: doc.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
-            throw GrooAuthError.invalidResponse("authorization_endpoint is not a valid URL: \(doc.authorizationEndpoint)")
-        }
-        components.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: config.clientId),
-            URLQueryItem(name: "redirect_uri", value: config.redirectURI),
-            URLQueryItem(name: "scope", value: config.scopeString),
-            URLQueryItem(name: "state", value: state),
-            URLQueryItem(name: "nonce", value: nonce),
-            URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256"),
-        ]
-        guard let authorizeURL = components.url else {
-            throw GrooAuthError.invalidResponse("failed to construct authorization URL")
-        }
-
-        let callbackURL = try await webAuthenticator.authenticate(
-            url: authorizeURL,
-            callbackScheme: config.callbackScheme,
-            anchor: presentationAnchor
-        )
-
-        let callbackItems = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        func value(_ name: String) -> String? { callbackItems.first(where: { $0.name == name })?.value }
-
-        if let callbackError = value("error") {
-            throw GrooAuthError.protocolError(OAuthProtocolError(error: callbackError, errorDescription: value("error_description")))
-        }
-        guard let returnedState = value("state"), returnedState == state else {
-            throw GrooAuthError.stateMismatch
-        }
-        guard let code = value("code") else {
-            throw GrooAuthError.invalidResponse("callback URL is missing code")
-        }
-
-        let response = try await requestToken(parameters: [
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": config.redirectURI,
-            "client_id": config.clientId,
-            "code_verifier": verifier,
-        ])
-
-        guard let idToken = response.id_token else {
-            throw GrooAuthError.invalidResponse("token response missing id_token")
-        }
-
-        let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
-        let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
-
-        let stored = StoredTokens(
-            accessToken: response.access_token,
-            refreshToken: response.refresh_token,
-            tokenType: response.token_type,
-            expiresAt: now().addingTimeInterval(TimeInterval(response.expires_in)),
-            idToken: idToken,
-            scope: response.scope,
-            user: user
-        )
-        try tokenStore.save(stored)
-        publish(.signedIn(user))
-        return user
     }
 
     /// Verifies `idToken` against the cached JWKS, self-healing exactly once if
@@ -359,7 +417,8 @@ public actor GrooAuthSession {
                 nonce: nonce,
                 now: now()
             )
-        } catch IDTokenFailure.unknownKid {
+        } catch IDTokenFailure.unknownKid(let kid) {
+            GrooAuthLog.signin.notice("signIn: id_token kid=\(kid, privacy: .public) not in cached JWKS, forcing re-fetch (self-heal retry)")
             let freshJWKS = try await loadJWKS(doc, forceRefresh: true)
             do {
                 return try verifyIDTokenCore(
@@ -396,6 +455,7 @@ public actor GrooAuthSession {
     /// never happened). Only a real nil (no error, no tokens) keeps the
     /// "nothing to revoke" `.revokedAndCleared` outcome.
     public func signOut() async -> SignOutResult {
+        GrooAuthLog.signin.notice("signOut: start")
         let loaded: StoredTokens?
         var revokeFailureReason: String?
         do {
@@ -406,6 +466,7 @@ public actor GrooAuthSession {
         }
 
         if let tokens = loaded, !tokens.refreshToken.isEmpty {
+            GrooAuthLog.signin.notice("signOut: revoke attempted")
             do {
                 let doc = try await loadDiscovery()
                 if let revocationEndpoint = doc.revocationEndpoint {
@@ -426,6 +487,7 @@ public actor GrooAuthSession {
                 revokeFailureReason = "failed to load discovery for revocation: \(error)"
             }
         }
+        GrooAuthLog.signin.notice("signOut: revoke result=\(revokeFailureReason == nil ? "ok" : "failed", privacy: .public)")
 
         do {
             try tokenStore.clear()
@@ -436,13 +498,16 @@ public actor GrooAuthSession {
             publish(.signedOut)
             let clearFailure = "failed to clear local tokens: \(error)"
             let reason = revokeFailureReason.map { "\($0); \(clearFailure)" } ?? clearFailure
+            GrooAuthLog.signin.error("signOut: done, outcome=clearedButRevokeFailed reason=\(reason, privacy: .public)")
             return .clearedButRevokeFailed(reason: reason)
         }
 
         publish(.signedOut)
         if let revokeFailureReason {
+            GrooAuthLog.signin.notice("signOut: done, outcome=clearedButRevokeFailed reason=\(revokeFailureReason, privacy: .public)")
             return .clearedButRevokeFailed(reason: revokeFailureReason)
         }
+        GrooAuthLog.signin.notice("signOut: done, outcome=revokedAndCleared")
         return .revokedAndCleared
     }
 
@@ -454,6 +519,7 @@ public actor GrooAuthSession {
     func requestToken(parameters: [String: String]) async throws -> TokenResponse {
         let doc = try await loadDiscovery()
         let (data, response) = try await postForm(url: doc.tokenEndpoint, parameters: parameters)
+        GrooAuthLog.signin.notice("signIn/refresh: token exchange HTTP done status=\(response.statusCode, privacy: .public)")
         guard response.statusCode == 200 else {
             let protocolError = try OAuthProtocolError.decode(data)
             throw GrooAuthError.protocolError(protocolError)
@@ -488,7 +554,11 @@ public actor GrooAuthSession {
     /// already cached — used by `verifyIDTokenSelfHealing` to get fresh keys
     /// after an unknown-`kid` failure (e.g. the IdP rotated signing keys).
     private func loadJWKS(_ doc: DiscoveryDocument, forceRefresh: Bool = false) async throws -> JWKS {
-        if !forceRefresh, let jwks { return jwks }
+        if !forceRefresh, let jwks {
+            GrooAuthLog.signin.notice("signIn: JWKS cache hit keyCount=\(jwks.keys.count, privacy: .public)")
+            return jwks
+        }
+        GrooAuthLog.signin.notice("signIn: JWKS fetch start forceRefresh=\(forceRefresh, privacy: .public)")
         let (data, response) = try await transport.send(URLRequest(url: doc.jwksURI))
         guard response.statusCode == 200 else {
             throw GrooAuthError.invalidResponse("jwks HTTP \(response.statusCode)")
@@ -500,6 +570,7 @@ public actor GrooAuthSession {
             throw GrooAuthError.invalidResponse("jwks response missing/invalid field: \(error)")
         }
         jwks = decoded
+        GrooAuthLog.signin.notice("signIn: JWKS fetch done keyCount=\(decoded.keys.count, privacy: .public)")
         return decoded
     }
 

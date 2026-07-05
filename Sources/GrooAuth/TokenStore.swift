@@ -62,6 +62,9 @@ public final class KeychainTokenStore: TokenStoring {
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        // OSStatus and "found or not" are never secret — the decoded token
+        // contents are, so only those two are logged here.
+        GrooAuthLog.token.notice("keychain load status=\(status, privacy: .public) found=\(result != nil, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
 
         if status == errSecItemNotFound {
             return nil
@@ -79,6 +82,7 @@ public final class KeychainTokenStore: TokenStoring {
         // Upsert: delete any existing item, then add fresh.
         let deleteStatus = SecItemDelete(baseQuery() as CFDictionary)
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            GrooAuthLog.token.error("keychain save: delete status=\(deleteStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public) (aborting before add)")
             throw GrooAuthError.transport("keychain save-delete \(deleteStatus)")
         }
 
@@ -88,6 +92,11 @@ public final class KeychainTokenStore: TokenStoring {
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
 
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        // This is the prime suspect for a macOS sandbox/entitlement failure:
+        // a non-zero addStatus here (e.g. -34018 errSecMissingEntitlement)
+        // means the token never actually landed in the keychain even though
+        // signIn() looked like it completed.
+        GrooAuthLog.token.notice("keychain save: delete status=\(deleteStatus, privacy: .public) add status=\(addStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
         guard addStatus == errSecSuccess else {
             throw GrooAuthError.transport("keychain save \(addStatus)")
         }
@@ -95,6 +104,7 @@ public final class KeychainTokenStore: TokenStoring {
 
     public func clear() throws {
         let status = SecItemDelete(baseQuery() as CFDictionary)
+        GrooAuthLog.token.notice("keychain clear status=\(status, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw GrooAuthError.transport("keychain clear \(status)")
         }
