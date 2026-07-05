@@ -69,6 +69,20 @@ public actor GrooAuthSession {
         self.pkceOverride = nil
     }
 
+    /// Convenience init for app call sites: wires up the production
+    /// `URLSessionTransport` and `ASWebAuthenticator` so callers don't need to
+    /// construct them by hand. Equivalent to calling the full init with those
+    /// two defaults and `now: Date.init`.
+    public init(config: GrooAuthConfig, tokenStore: TokenStoring) {
+        self.init(
+            config: config,
+            tokenStore: tokenStore,
+            transport: URLSessionTransport(),
+            webAuthenticator: ASWebAuthenticator(),
+            now: Date.init
+        )
+    }
+
     /// Test-only seam (see `PKCEOverride`). Requires the override explicitly (no
     /// default) so this can never be selected by a production call site that omits it.
     init(
