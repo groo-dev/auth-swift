@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test & Release
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+      # GrooAuth is a source-only SPM library — consumers resolve it by git tag,
+      # so there is no binary artifact to upload. record-release bumps the
+      # version in the Ops dashboard, tags the commit (v{version}), and creates
+      # the GitHub release.
+      - name: Record release
+        uses: groo-dev/record-release@v1
+        with:
+          token: ${{ secrets.OPS_API_TOKEN }}
+          environment: production
+          bump: patch
