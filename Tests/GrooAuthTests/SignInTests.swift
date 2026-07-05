@@ -1,6 +1,26 @@
 import XCTest
 import CryptoKit
+#if canImport(AuthenticationServices)
+import AuthenticationServices
+#endif
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 @testable import GrooAuth
+
+/// Real `ASPresentationAnchor` for tests — the test target builds for the macOS
+/// (or iOS) host, so a throwaway window/view satisfies the type without needing
+/// an actual presented UI.
+@MainActor
+private func makeTestAnchor() -> ASPresentationAnchor {
+    #if canImport(AppKit)
+    return NSWindow()
+    #elseif canImport(UIKit)
+    return UIWindow()
+    #endif
+}
 
 final class SignInTests: XCTestCase {
     private let testConfig = GrooAuthConfig(
@@ -59,7 +79,7 @@ final class SignInTests: XCTestCase {
         let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
 
         do {
-            _ = try await session.signIn(presentationAnchor: nil)
+            _ = try await session.signIn(presentationAnchor: await makeTestAnchor())
             XCTFail("expected the stub's userCancelled failure to propagate")
         } catch GrooAuthError.userCancelled {
             // expected
@@ -98,7 +118,7 @@ final class SignInTests: XCTestCase {
         let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
 
         do {
-            _ = try await session.signIn(presentationAnchor: nil)
+            _ = try await session.signIn(presentationAnchor: await makeTestAnchor())
             XCTFail("expected .stateMismatch")
         } catch GrooAuthError.stateMismatch {
             // expected
@@ -134,7 +154,7 @@ final class SignInTests: XCTestCase {
         let stub = StubWebAuthenticator(result: .success(callback))
         let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
 
-        let user = try await session.signIn(presentationAnchor: nil)
+        let user = try await session.signIn(presentationAnchor: await makeTestAnchor())
 
         XCTAssertEqual(user.sub, "user-1")
         XCTAssertEqual(user.email, "a@b.c")
@@ -160,7 +180,7 @@ final class SignInTests: XCTestCase {
         let session = makeSession(transport: transport, webAuthenticator: stub, store: store)
 
         do {
-            _ = try await session.signIn(presentationAnchor: nil)
+            _ = try await session.signIn(presentationAnchor: await makeTestAnchor())
             XCTFail("expected .protocolError")
         } catch GrooAuthError.protocolError(let err) {
             XCTAssertEqual(err.error, "access_denied")
@@ -198,7 +218,7 @@ final class SignInTests: XCTestCase {
         let initial = await iterator.next()
         XCTAssertEqual(initial, .signedOut, "a fresh subscriber sees the current (signed-out) state immediately")
 
-        let user = try await session.signIn(presentationAnchor: nil)
+        let user = try await session.signIn(presentationAnchor: await makeTestAnchor())
 
         let afterSignIn = await iterator.next()
         XCTAssertEqual(afterSignIn, .signedIn(user), "signIn success must publish .signedIn on the state stream")

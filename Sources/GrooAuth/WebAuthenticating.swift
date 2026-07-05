@@ -7,7 +7,7 @@ import AuthenticationServices
 /// (`GrooAuthSession.signIn`) can be driven by a test double. `StubWebAuthenticator`
 /// (test target) is the fake; `ASWebAuthenticator` below is the real thing.
 public protocol WebAuthenticating: Sendable {
-    func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor?) async throws -> URL
+    func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor) async throws -> URL
 }
 
 #if canImport(AuthenticationServices)
@@ -15,27 +15,20 @@ public protocol WebAuthenticating: Sendable {
 /// Delegate object satisfying `ASWebAuthenticationPresentationContextProviding`.
 /// `ASWebAuthenticationSession` calls `presentationAnchor(for:)` on the main thread
 /// while presenting; this just returns the anchor the caller supplied.
-///
-/// `anchor` is `nil` only when the caller passed `nil` to `signIn` — that's a caller
-/// error (there is no window to present from), so we fail loudly instead of silently
-/// conjuring a throwaway window.
 @MainActor
 private final class PresentationContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
-    let anchor: ASPresentationAnchor?
+    let anchor: ASPresentationAnchor
     /// Retains the session for the lifetime of this provider so it isn't
     /// deallocated (which cancels the in-flight auth) before completion fires.
     var session: ASWebAuthenticationSession?
 
-    init(anchor: ASPresentationAnchor?) {
+    init(anchor: ASPresentationAnchor) {
         self.anchor = anchor
         super.init()
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        guard let anchor else {
-            preconditionFailure("ASWebAuthenticator.authenticate(anchor:) was called with a nil anchor")
-        }
-        return anchor
+        anchor
     }
 }
 
@@ -48,7 +41,7 @@ private final class PresentationContextProvider: NSObject, ASWebAuthenticationPr
 public final class ASWebAuthenticator: WebAuthenticating, @unchecked Sendable {
     public init() {}
 
-    public func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor?) async throws -> URL {
+    public func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor) async throws -> URL {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             Task { @MainActor in
                 let provider = PresentationContextProvider(anchor: anchor)

@@ -25,7 +25,7 @@ final class StubWebAuthenticator: WebAuthenticating, @unchecked Sendable {
         self.result = result
     }
 
-    func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor?) async throws -> URL {
+    func authenticate(url: URL, callbackScheme: String, anchor: ASPresentationAnchor) async throws -> URL {
         lastURL = url
         lastCallbackScheme = callbackScheme
         switch result {

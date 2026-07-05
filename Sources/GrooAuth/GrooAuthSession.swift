@@ -198,7 +198,7 @@ public actor GrooAuthSession {
     /// presentation, a `state` mismatch, an `error=` callback, a failed token
     /// exchange, or a failed `id_token` verification all leave the token store
     /// untouched.
-    public func signIn(presentationAnchor: ASPresentationAnchor?) async throws -> GrooUser {
+    public func signIn(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
         let verifier: String
         let state: String
         let nonce: String
