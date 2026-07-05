@@ -2,6 +2,9 @@ import Foundation
 #if canImport(AuthenticationServices)
 import AuthenticationServices
 #endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Abstraction over `ASWebAuthenticationSession` so the session actor's sign-in flow
 /// (`GrooAuthSession.signIn`) can be driven by a test double. `StubWebAuthenticator`
@@ -28,7 +31,18 @@ private final class PresentationContextProvider: NSObject, ASWebAuthenticationPr
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        anchor
+        let a = anchor
+        #if canImport(AppKit)
+        let win = a as? NSWindow
+        let cls = String(describing: type(of: a))
+        let vis = win?.isVisible ?? false
+        let key = win?.isKeyWindow ?? false
+        GrooAuthLog.web.notice("presentationAnchor(for:) requested by system anchorClass=\(cls, privacy: .public) isVisible=\(vis, privacy: .public) isKey=\(key, privacy: .public)")
+        #else
+        let cls = String(describing: type(of: a))
+        GrooAuthLog.web.notice("presentationAnchor(for:) requested by system anchorClass=\(cls, privacy: .public)")
+        #endif
+        return a
     }
 }
 
@@ -79,8 +93,9 @@ public final class ASWebAuthenticator: WebAuthenticating, @unchecked Sendable {
                 session.prefersEphemeralWebBrowserSession = false
                 session.presentationContextProvider = provider
                 provider.session = session
-                GrooAuthLog.web.notice("presenting ASWebAuthenticationSession callbackScheme=\(callbackScheme, privacy: .public) authHost=\(url.host ?? "nil", privacy: .public) ephemeral=false")
-                session.start()
+                GrooAuthLog.web.notice("presenting ASWebAuthenticationSession callbackScheme=\(callbackScheme, privacy: .public) authHost=\(url.host ?? "nil", privacy: .public) ephemeral=false canStart=\(session.canStart, privacy: .public)")
+                let started = session.start()
+                GrooAuthLog.web.notice("session.start() returned=\(started, privacy: .public) — presentation now in progress")
             }
         }
     }
