@@ -2,3 +2,6 @@
 .DS_Store
 *.xcodeproj
 .superpowers/
+
+# Xcode per-user state, created by opening the package in Xcode.
+.swiftpm/

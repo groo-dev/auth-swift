@@ -3,11 +3,11 @@
 [![CI](https://github.com/groo-dev/auth-swift/actions/workflows/release.yml/badge.svg)](https://github.com/groo-dev/auth-swift/actions/workflows/release.yml)
 ![Platforms](https://img.shields.io/badge/platforms-iOS%2018%20%7C%20macOS%2014-blue)
 ![Swift](https://img.shields.io/badge/Swift-6.0-orange)
-![License](https://img.shields.io/badge/license-Proprietary-red)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 A small, dependency-free **OpenID Connect (OIDC) client for Apple platforms** — authorization code flow with PKCE, built for native iOS and macOS apps. It handles the whole sign-in lifecycle (login, token storage, refresh, revoking sign-out) behind a tiny `actor` API.
 
-Built for [Groo](https://groo.dev) Accounts. It implements standard OIDC — discovery, public (PKCE) clients, and ES256-signed ID tokens. The source is public so it can be resolved as a Swift Package in CI, but it is **proprietary, not open source** (see [License](#license)).
+Built for [Groo](https://groo.dev) Accounts, and usable against any provider that implements standard OIDC — discovery, public (PKCE) clients, and ES256-signed ID tokens. **MIT licensed** (see [License](#license)).
 
 ```swift
 let session = GrooAuthSession(
@@ -207,6 +207,8 @@ Everything the session touches is a protocol, so it's straightforward to drive i
 
 ## License
 
-**Proprietary — all rights reserved.** Copyright © 2026 Groo. The source is
-publicly visible to support dependency resolution in CI, but no rights to use,
-copy, modify, or distribute it are granted. See [LICENSE](LICENSE).
+**MIT.** Copyright © 2026 Groo. See [LICENSE](LICENSE).
+
+Relicensed from proprietary on 2026-08-23. It was previously public only so
+Swift Package Manager could resolve it in CI, which granted no rights to
+anyone; it is now genuinely usable.
