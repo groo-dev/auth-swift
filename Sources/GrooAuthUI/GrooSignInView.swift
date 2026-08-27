@@ -183,6 +183,8 @@ public struct GrooSignInView: View {
             return detail
         case .protocolError(let oauth), .interactionRequired(let oauth):
             return oauth.errorDescription ?? oauth.error
+        case .insufficientScope(let scope):
+            return "This app was not granted permission to \(scope)."
         case .passkeyUnavailable:
             // Never rendered — the caller hides the button instead — but the
             // switch must stay exhaustive, and a sentence is better than a crash

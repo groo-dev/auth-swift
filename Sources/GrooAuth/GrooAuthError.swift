@@ -31,6 +31,14 @@ public enum GrooAuthError: Error, Sendable {
     /// forced every caller to guess which had happened.
     case passkeyUnavailable
 
+    /// The presented token does not carry a scope the request needs, and names
+    /// which one.
+    ///
+    /// Separate from `protocolError` because the fix is specific and the app can
+    /// state it: the person was never asked to grant this, so they have to sign
+    /// in again and approve it. Nothing about retrying will help.
+    case insufficientScope(String)
+
     /// The issuer refused to complete a native sign-in and needs the person to be
     /// shown something the app cannot render — a consent screen, a step-up
     /// challenge, or an explanation that they have no access.
@@ -63,6 +71,8 @@ extension GrooAuthError: LocalizedError {
             return "Sign-in was cancelled."
         case .passkeyUnavailable:
             return "No passkey is available on this device."
+        case .insufficientScope(let scope):
+            return "This app was not granted permission to \(scope). Sign in again to approve it."
         case .interactionRequired(let error):
             return "\(error.error): \(error.errorDescription ?? "")"
         }
