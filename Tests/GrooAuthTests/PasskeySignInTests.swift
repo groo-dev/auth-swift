@@ -43,6 +43,17 @@ private final class StubPasskeyAuthenticator: PasskeyAuthenticating, @unchecked 
         lastAllowedCredentialIDs = allowedCredentialIDs
         return try result.get()
     }
+
+    func register(
+        relyingPartyIdentifier: String,
+        challenge: Data,
+        userID: Data,
+        userName: String,
+        anchor: ASPresentationAnchor
+    ) async throws -> PasskeyRegistration {
+        XCTFail("sign-in must never create a passkey")
+        throw GrooAuthError.userCancelled
+    }
 }
 
 final class PasskeySignInTests: XCTestCase {

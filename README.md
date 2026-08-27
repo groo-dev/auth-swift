@@ -165,10 +165,49 @@ grant silently, and that is the point.
 Without it, `/v1/account/profile` answers 403 and the screen says which scope is
 missing rather than showing an empty form.
 
-Passkeys, devices, connected apps and API tokens are deliberately NOT native.
-Each is a list with its own destructive actions, and a half-built version of one
-is worse than an honest link to the finished one — which is what `consoleURL` is.
-Pass `nil` to hide the link entirely.
+### 3d. Security sections
+
+The account screen also shows passkeys, devices, connected apps and API tokens —
+whichever the app asks for:
+
+```swift
+GrooUserButton(
+    controller: controller,
+    consoleURL: URL(string: "https://me.groo.dev/account"),
+    sections: [.passkeys, .devices],
+    showsLabel: true
+)
+```
+
+**Each section costs a scope**, and your app should request exactly the ones it
+shows. `GrooAccountSections.requiredScopes` gives them to you, so the two cannot
+drift:
+
+```swift
+let sections: GrooAccountSections = [.passkeys, .devices]
+GrooAuthConfig(
+    // ...
+    scopes: ["openid", "profile", "email", "offline_access", "accounts:profile"]
+        + sections.requiredScopes
+)
+```
+
+A section whose scope is missing shows the refusal, naming the scope, and the
+other sections still render — the store keeps errors per section for exactly that
+reason. Passing `[]` (the default) shows none of them and requests nothing.
+
+**Adding a passkey is the one account action a web console cannot do for
+someone**: a passkey is bound to the authenticator that created it, so a browser
+elsewhere cannot enrol this device. `session.registerPasskey(name:presentationAnchor:)`
+does it, and the passkeys section offers it. Both of its endpoints are step-up
+gated — adding a credential that can authenticate the account outright is as
+sensitive as changing a password — so a sign-in older than five minutes is
+refused, and the caller should offer a fresh one rather than retry.
+
+Creating an API token is deliberately NOT offered. A token is shown once and has
+to be copied somewhere safe, which is a desk job.
+
+`consoleURL` remains the way to everything else; pass `nil` to hide the link.
 
 ### 4. Call your APIs
 
@@ -238,6 +277,8 @@ case .clearedButRevokeFailed(let reason):
 | `GrooUserButton` | Avatar button that opens the account screen. |
 | `GrooAccountView` | The account screen itself, if you want to present it yourself. |
 | `GrooAccountStore` | `@Observable` profile load/save over `/v1/account/profile`. |
+| `GrooAccountSections` | Which security lists to show, and the scopes they need. |
+| `GrooAccountListsStore` | `@Observable` passkeys / devices / connected apps / tokens. |
 | `GrooAvatar` | The initials circle, on its own. |
 
 ## Error handling

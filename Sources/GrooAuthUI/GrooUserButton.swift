@@ -51,6 +51,7 @@ public struct GrooAvatar: View {
 public struct GrooUserButton: View {
     private let controller: GrooAuthController
     private let consoleURL: URL?
+    private let sections: GrooAccountSections
     private let showsLabel: Bool
 
     @Environment(\.grooAuthTheme) private var theme
@@ -59,11 +60,19 @@ public struct GrooUserButton: View {
     /// - Parameters:
     ///   - consoleURL: the hosted account page, passed through to
     ///     `GrooAccountView`. `nil` hides the link.
+    ///   - sections: which security lists the account screen shows. Each costs a
+    ///     scope — see `GrooAccountSections.requiredScopes`.
     ///   - showsLabel: `true` renders name and email beside the avatar, for a
     ///     settings row; `false` is the bare circle for a toolbar.
-    public init(controller: GrooAuthController, consoleURL: URL? = nil, showsLabel: Bool = false) {
+    public init(
+        controller: GrooAuthController,
+        consoleURL: URL? = nil,
+        sections: GrooAccountSections = [],
+        showsLabel: Bool = false
+    ) {
         self.controller = controller
         self.consoleURL = consoleURL
+        self.sections = sections
         self.showsLabel = showsLabel
     }
 
@@ -92,7 +101,7 @@ public struct GrooUserButton: View {
         .accessibilityLabel("Account")
         .accessibilityIdentifier("grooUserButton")
         .sheet(isPresented: $isPresentingAccount) {
-            GrooAccountView(controller: controller, consoleURL: consoleURL)
+            GrooAccountView(controller: controller, consoleURL: consoleURL, sections: sections)
                 .environment(\.grooAuthTheme, theme)
         }
     }
