@@ -655,7 +655,10 @@ public actor GrooAuthSession {
         let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
         // Claims are fine to log (post-verification, non-secret); the raw JWT never is.
         GrooAuthLog.signin.notice("redeemCode: id_token verified sub=\(claims.sub, privacy: .public) iss=\(claims.iss, privacy: .public) aud=\(claims.aud, privacy: .public) exp=\(claims.exp, privacy: .public)")
-        let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
+        var user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
+        if user.email == nil || user.name == nil {
+            user = await userInfoMerged(into: user, doc: doc, accessToken: response.access_token)
+        }
 
         let stored = StoredTokens(
             accessToken: response.access_token,
@@ -673,6 +676,51 @@ public actor GrooAuthSession {
         publish(.signedIn(user))
         GrooAuthLog.signin.notice("redeemCode: published signedIn, returning user")
         return user
+    }
+
+    /// Fills in `email` and `name` from the UserInfo endpoint.
+    ///
+    /// OIDC Core 5.4 puts the `profile` and `email` claims at UserInfo for an
+    /// authorization-code flow, and this issuer follows that — its `id_token`
+    /// carries `sub`, `auth_time`, `nonce` and `amr`, and nothing else. Without
+    /// this call `GrooUser.email` and `.name` are nil for every client, and every
+    /// app that shows "who am I signed in as" shows nothing.
+    ///
+    /// Best-effort by design. The sign-in has already SUCCEEDED by this point —
+    /// tokens are in hand and valid — and failing it because a display name could
+    /// not be fetched would trade a working session for a cosmetic detail. The
+    /// failure is logged rather than swallowed, so it is diagnosable rather than
+    /// invisible.
+    private func userInfoMerged(into user: GrooUser, doc: DiscoveryDocument, accessToken: String) async -> GrooUser {
+        guard let endpoint = doc.userinfoEndpoint else {
+            GrooAuthLog.signin.notice("userinfo: issuer advertises no endpoint, leaving profile claims empty")
+            return user
+        }
+        struct Claims: Decodable {
+            let sub: String
+            let name: String?
+            let email: String?
+        }
+        do {
+            var request = URLRequest(url: endpoint)
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            let (data, http) = try await transport.send(request)
+            guard (200..<300).contains(http.statusCode) else {
+                GrooAuthLog.signin.error("userinfo: HTTP \(http.statusCode, privacy: .public)")
+                return user
+            }
+            let claims = try JSONDecoder().decode(Claims.self, from: data)
+            // A UserInfo response for a DIFFERENT subject is not a partial answer,
+            // it is a mixed-up one — OIDC Core 5.3.2 requires this check.
+            guard claims.sub == user.sub else {
+                GrooAuthLog.signin.error("userinfo: sub does not match the id_token, discarding")
+                return user
+            }
+            return GrooUser(sub: user.sub, email: user.email ?? claims.email, name: user.name ?? claims.name)
+        } catch {
+            GrooAuthLog.signin.error("userinfo: \(String(describing: error), privacy: .public)")
+            return user
+        }
     }
 
     /// Verifies `idToken` against the cached JWKS, self-healing exactly once if
