@@ -84,6 +84,17 @@ public final class GrooAuthController {
         try await session.signIn(presentationAnchor: presentationAnchor)
     }
 
+    /// Presents the platform passkey sheet — no browser at any point.
+    ///
+    /// Throws `.passkeyUnavailable` when this device holds no passkey for the
+    /// issuer, and `.interactionRequired` when the issuer needs to show a screen
+    /// this app has none of. Both mean "fall back to `signIn`", and neither is a
+    /// failure to report to the person.
+    @discardableResult
+    public func signInWithPasskey(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
+        try await session.signInWithPasskey(presentationAnchor: presentationAnchor)
+    }
+
     /// Local tokens are cleared either way; the result says whether the issuer was
     /// also reached. A network failure must still leave this device signed out.
     @discardableResult

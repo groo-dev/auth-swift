@@ -17,6 +17,11 @@ private struct UnusedTransport: HTTPTransporting {
         XCTFail("no network should be reached in these tests")
         throw GrooAuthError.userCancelled
     }
+
+    func sendWithoutFollowingRedirects(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        XCTFail("no network should be reached in these tests")
+        throw GrooAuthError.userCancelled
+    }
 }
 
 private func makeSession(storing tokens: StoredTokens?) -> GrooAuthSession {

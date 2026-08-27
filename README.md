@@ -104,6 +104,45 @@ do {
 }
 ```
 
+### 3b. Sign in with a passkey, natively
+
+`signInWithPasskey` runs the platform's own ceremony — Face ID, no browser at any
+point — and ends holding the same tokens `signIn` produces.
+
+```swift
+do {
+    let user = try await session.signInWithPasskey(presentationAnchor: window)
+} catch GrooAuthError.passkeyUnavailable {
+    // No passkey on this device. Not an error: offer signIn instead.
+} catch GrooAuthError.interactionRequired {
+    // The issuer needs a screen this app has none of — consent, most often, and
+    // only ever once. Fall back to signIn, which is where those screens live.
+} catch GrooAuthError.userCancelled {
+    // Sheet dismissed.
+}
+```
+
+Under the hood the assertion buys a one-time ticket and the ticket buys one trip
+through `/authorize`, so the issuer decides entitlement, consent and scope in the
+same place it does for a browser. Nothing about that is visible to you; what is
+visible is that two of the errors above mean "use `signIn`", not "something broke".
+
+**Two prerequisites, and both fail silently.** Neither produces an error message
+that names the cause — the passkey sheet simply reports that there are no
+credentials.
+
+1. **Associated domains.** The adopting app needs
+   `webcredentials:<your issuer host>` in its Associated Domains entitlement — for
+   example `webcredentials:me.groo.dev`. Without it the platform will not look for
+   a passkey scoped to that relying party, and finds none.
+2. **An `ios` client row carrying `bundle_id` and `apple_team_id`.** The issuer
+   serves `/.well-known/apple-app-site-association` from those two columns, and
+   Apple refuses an app's claim to a domain that does not name it. A row missing
+   either column leaves the app out of the file, with the same symptom.
+
+The relying party is always derived from `GrooAuthConfig.issuer`, never written
+down as a literal — a hardcoded host would work for exactly one workspace.
+
 ### 4. Call your APIs
 
 `accessToken()` returns a valid bearer token, refreshing transparently if it is near expiry:
@@ -157,7 +196,7 @@ case .clearedButRevokeFailed(let reason):
 
 | Type | Role |
 |---|---|
-| `GrooAuthSession` (`actor`) | The entry point — `signIn`, `signOut`, `accessToken`, `forceRefreshAccessToken`, `currentState`, `stateStream`. |
+| `GrooAuthSession` (`actor`) | The entry point — `signIn`, `signInWithPasskey`, `signOut`, `accessToken`, `forceRefreshAccessToken`, `currentState`, `stateStream`. |
 | `GrooAuthConfig` | Issuer, client ID, redirect URI, scopes, keychain service/access group. |
 | `GrooUser` | `sub`, `email`, `name` from the verified ID token. |
 | `GrooAuthState` | `.signedOut` / `.signedIn(GrooUser)`. |
@@ -167,6 +206,8 @@ case .clearedButRevokeFailed(let reason):
 | `KeychainTokenStore` | Production store (Keychain, after-first-unlock). |
 | `InMemoryTokenStore` | Non-persistent store — handy for tests and previews. |
 | `WebAuthenticating` | Protocol over `ASWebAuthenticationSession` (inject a fake in tests). |
+| `PasskeyAuthenticating` | Protocol over `ASAuthorizationController` (inject a fake in tests). |
+| `PasskeyAssertion` | One passkey assertion, base64url, as the server's verifier expects. |
 
 ## Error handling
 
@@ -181,6 +222,8 @@ case .clearedButRevokeFailed(let reason):
 | `.stateMismatch` | The `state` returned didn't match — request rejected. |
 | `.idTokenInvalid(String)` | The ID token failed signature/claim verification. |
 | `.signedOut` | No valid session (e.g. refresh token expired/revoked). |
+| `.passkeyUnavailable` | No passkey on this device for the issuer. Offer `signIn`. |
+| `.interactionRequired(OAuthProtocolError)` | The issuer needs a screen the app has none of. Fall back to `signIn`. |
 
 ## Sharing tokens with an app extension
 
