@@ -48,41 +48,6 @@ public struct GrooAPIToken: Sendable, Identifiable, Equatable, Decodable {
     public let createdAt: String
 }
 
-// MARK: - Sections
-
-/// Which account sections an app shows.
-///
-/// An option set rather than four booleans, and a decision the APP makes rather
-/// than the library: each section costs a scope, and a consent screen listing
-/// permissions the app never exercises teaches people to approve without reading.
-/// An app with no use for API tokens should not be asking for `accounts:tokens`.
-public struct GrooAccountSections: OptionSet, Sendable {
-    public let rawValue: Int
-    public init(rawValue: Int) { self.rawValue = rawValue }
-
-    /// Needs `accounts:passkeys`.
-    public static let passkeys = GrooAccountSections(rawValue: 1 << 0)
-    /// Needs `accounts:devices`.
-    public static let devices = GrooAccountSections(rawValue: 1 << 1)
-    /// Needs `accounts:apps`.
-    public static let connectedApps = GrooAccountSections(rawValue: 1 << 2)
-    /// Needs `accounts:tokens`.
-    public static let tokens = GrooAccountSections(rawValue: 1 << 3)
-
-    public static let all: GrooAccountSections = [.passkeys, .devices, .connectedApps, .tokens]
-
-    /// The scopes these sections require, so an app can build its scope list from
-    /// the sections it shows instead of keeping the two in step by hand.
-    public var requiredScopes: [String] {
-        var scopes: [String] = []
-        if contains(.passkeys) { scopes.append("accounts:passkeys") }
-        if contains(.devices) { scopes.append("accounts:devices") }
-        if contains(.connectedApps) { scopes.append("accounts:apps") }
-        if contains(.tokens) { scopes.append("accounts:tokens") }
-        return scopes
-    }
-}
-
 // MARK: - Store
 
 private struct PasskeysEnvelope: Decodable { let passkeys: [GrooPasskey] }

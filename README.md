@@ -274,10 +274,10 @@ case .clearedButRevokeFailed(let reason):
 | `WebAuthenticating` | Protocol over `ASWebAuthenticationSession` (inject a fake in tests). |
 | `PasskeyAuthenticating` | Protocol over `ASAuthorizationController` (inject a fake in tests). |
 | `PasskeyAssertion` | One passkey assertion, base64url, as the server's verifier expects. |
+| `GrooAccountSections` | Which security lists to show, and the scopes they need. In `GrooAuth`, not `GrooAuthUI`: it builds a config, and that construction is often shared with an app extension. |
 | `GrooUserButton` | Avatar button that opens the account screen. |
 | `GrooAccountView` | The account screen itself, if you want to present it yourself. |
 | `GrooAccountStore` | `@Observable` profile load/save over `/v1/account/profile`. |
-| `GrooAccountSections` | Which security lists to show, and the scopes they need. |
 | `GrooAccountListsStore` | `@Observable` passkeys / devices / connected apps / tokens. |
 | `GrooAvatar` | The initials circle, on its own. |
 
