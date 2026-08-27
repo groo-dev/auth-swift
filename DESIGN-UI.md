@@ -85,6 +85,14 @@ struct GrooAuthTheme {
 Token names mirror `--ga-*` deliberately, so the two SDKs can be themed from one
 brand definition.
 
+Every default colour is appearance-adaptive, via `Color.grooAdaptive(light:dark:)`.
+A single fixed palette was the first attempt and it was wrong for the same reason
+unstyleable views are: Space's app is dark end to end, so a fixed light default
+rendered its sign-in screen as a white flash before a black app — and that is the
+default every adopter gets before they configure anything. A colour an app
+supplies is still taken exactly as given; nothing derives a second appearance
+behind its back.
+
 ## Passkeys
 
 The prerequisite is met: `me.groo.dev` and `me.groo.space` now serve

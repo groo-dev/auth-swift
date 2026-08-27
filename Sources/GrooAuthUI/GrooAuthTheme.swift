@@ -34,16 +34,43 @@ public struct GrooAuthTheme: Sendable {
     public var titleFont: Font
     public var bodyFont: Font
 
+    /// The default palette, as named constants.
+    ///
+    /// Constants rather than expressions inlined into the initialiser below,
+    /// because each `grooAdaptive` call builds a fresh platform colour and
+    /// `Color` compares those by identity. Inlined, `GrooAuthTheme().surface`
+    /// would not equal `GrooAuthTheme.groo.surface` despite drawing the same
+    /// pixels.
+    ///
+    /// Public so a theme that changes one token can build on the rest rather
+    /// than restating them.
+    public enum Default {
+        /// Every colour here is appearance-adaptive, so an app that never
+        /// configures a theme looks right in dark mode as well as light.
+        public static let accent = Color.grooAdaptive(light: .init(0.09, 0.42, 0.29), dark: .init(0.24, 0.70, 0.49))
+        public static let onAccent = Color.grooAdaptive(light: .init(1, 1, 1), dark: .init(0.04, 0.09, 0.07))
+        public static let canvas = Color.grooAdaptive(light: .init(0.95, 0.96, 0.95), dark: .init(0.07, 0.09, 0.08))
+        public static let surface = Color.grooAdaptive(light: .init(1, 1, 1), dark: .init(0.11, 0.14, 0.12))
+        public static let ink = Color.grooAdaptive(light: .init(0.09, 0.13, 0.11), dark: .init(0.93, 0.95, 0.94))
+        public static let muted = Color.grooAdaptive(light: .init(0.40, 0.44, 0.42), dark: .init(0.62, 0.67, 0.64))
+        public static let line = Color.grooAdaptive(light: .init(0.86, 0.89, 0.87), dark: .init(0.20, 0.24, 0.22))
+        public static let danger = Color.grooAdaptive(light: .init(0.64, 0.22, 0.22), dark: .init(0.94, 0.45, 0.45))
+        public static let cornerRadius: CGFloat = 12
+    }
+
+    /// A supplied token is taken exactly as given — an app that hands over one
+    /// brand colour is not asked to supply two, and nothing derives a second
+    /// appearance behind its back.
     public init(
-        accent: Color = Color(red: 0.09, green: 0.42, blue: 0.29),
-        onAccent: Color = .white,
-        canvas: Color = Color(red: 0.95, green: 0.96, blue: 0.95),
-        surface: Color = .white,
-        ink: Color = Color(red: 0.09, green: 0.13, blue: 0.11),
-        muted: Color = Color(red: 0.40, green: 0.44, blue: 0.42),
-        line: Color = Color(red: 0.86, green: 0.89, blue: 0.87),
-        danger: Color = Color(red: 0.64, green: 0.22, blue: 0.22),
-        cornerRadius: CGFloat = 12,
+        accent: Color = Default.accent,
+        onAccent: Color = Default.onAccent,
+        canvas: Color = Default.canvas,
+        surface: Color = Default.surface,
+        ink: Color = Default.ink,
+        muted: Color = Default.muted,
+        line: Color = Default.line,
+        danger: Color = Default.danger,
+        cornerRadius: CGFloat = Default.cornerRadius,
         titleFont: Font = .largeTitle.bold(),
         bodyFont: Font = .body
     ) {
@@ -61,7 +88,8 @@ public struct GrooAuthTheme: Sendable {
     }
 
     /// The default. Matches `--ga-*` in `@groo.dev/auth-react` so an app using
-    /// both SDKs looks like one product without configuring either.
+    /// both SDKs looks like one product without configuring either. Adaptive in
+    /// both appearances — see the initialiser.
     public static let groo = GrooAuthTheme()
 }
 
