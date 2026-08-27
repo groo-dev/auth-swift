@@ -13,9 +13,16 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
     struct Response {
         let status: Int
         let body: String
+        /// Response headers. Only the no-redirect path needs them — a 302's
+        /// `Location` is the entire answer there.
+        var headers: [String: String]? = nil
     }
 
     private var routes: [String: Response]
+    /// Matched by URL PREFIX when no exact route applies. `/authorize` carries a
+    /// freshly generated state and nonce, so an exact key cannot be written down
+    /// in a test that does not also own those values.
+    private var prefixRoutes: [(prefix: String, response: Response)] = []
     /// Per-URL queues of responses that take priority over `routes`, popped one
     /// per call in order (falling back to `routes` once exhausted). Lets tests
     /// simulate an endpoint's response changing across repeated fetches — e.g.
@@ -36,6 +43,11 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
     /// Queues `responses` for `urlString`, each call to that URL popping the
     /// next one in order. Once the queue is exhausted, subsequent calls fall
     /// back to the static entry in `routes` (if any).
+    /// Answers any request whose URL starts with `prefix`, after exact routes.
+    func setPrefixRoute(_ prefix: String, status: Int, body: String = "", headers: [String: String]? = nil) {
+        prefixRoutes.append((prefix, Response(status: status, body: body, headers: headers)))
+    }
+
     func setSequence(for urlString: String, responses: [(status: Int, body: String)]) {
         sequences[urlString] = responses.map { Response(status: $0.status, body: $0.body) }
     }
@@ -55,6 +67,8 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
             sequences[key] = queued
         } else if let fixed = routes[key] {
             route = fixed
+        } else if let prefixed = prefixRoutes.first(where: { key.hasPrefix($0.prefix) })?.response {
+            route = prefixed
         } else {
             throw GrooAuthError.transport("MockTransport: no route mapped for \(key)")
         }
@@ -63,11 +77,18 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
             url: url,
             statusCode: route.status,
             httpVersion: "HTTP/1.1",
-            headerFields: nil
+            headerFields: route.headers
         ) else {
             throw GrooAuthError.transport("MockTransport: failed to construct HTTPURLResponse for \(key)")
         }
         return (data, response)
+    }
+
+    /// Same routing. The distinction the protocol draws is about following
+    /// redirects, and a mock never follows anything — so a 302 route simply
+    /// arrives intact, which is exactly what the caller under test expects.
+    func sendWithoutFollowingRedirects(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        try await send(request)
     }
 
     /// Number of requests seen for a given URL string (across all HTTP methods).

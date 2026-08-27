@@ -25,6 +25,13 @@ public struct GrooSignInView: View {
     @State private var isSigningIn = false
     @State private var errorMessage: String?
 
+    /// Hides the passkey button once this device has told us it has none.
+    ///
+    /// There is no way to ASK — the platform only answers by running the ceremony
+    /// — so the button is offered until an attempt says otherwise, and then it
+    /// stops being offered. Leaving it up would invite the same dead end twice.
+    @State private var passkeyOffered = true
+
     public init(
         appName: String,
         tagline: String? = nil,
@@ -70,22 +77,75 @@ public struct GrooSignInView: View {
                     .accessibilityIdentifier("grooSignIn.error")
             }
 
-            Button(action: signIn) {
-                HStack {
-                    if isSigningIn { ProgressView().controlSize(.small) }
-                    Text(isSigningIn ? "Signing in…" : "Sign in with Groo")
-                        .fontWeight(.semibold)
+            VStack(spacing: 12) {
+                if passkeyOffered {
+                    // First, as it is on the hosted page: for someone who has a
+                    // passkey it is both the fastest and the strongest option, and
+                    // putting it second teaches people to ignore it.
+                    Button(action: signInWithPasskey) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "person.badge.key.fill")
+                            Text("Sign in with a passkey").fontWeight(.semibold)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 50)
+                        .background(theme.accent, in: RoundedRectangle(cornerRadius: theme.cornerRadius))
+                        .foregroundStyle(theme.onAccent)
+                    }
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("grooSignIn.passkeyButton")
                 }
-                .frame(maxWidth: .infinity, minHeight: 50)
-                .background(theme.accent, in: RoundedRectangle(cornerRadius: theme.cornerRadius))
-                .foregroundStyle(theme.onAccent)
+
+                Button(action: signIn) {
+                    HStack {
+                        if isSigningIn { ProgressView().controlSize(.small) }
+                        Text(isSigningIn ? "Signing in…" : "Sign in with Groo")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 50)
+                    .background(
+                        passkeyOffered ? AnyShapeStyle(theme.surface) : AnyShapeStyle(theme.accent),
+                        in: RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    )
+                    .foregroundStyle(passkeyOffered ? theme.ink : theme.onAccent)
+                }
+                .disabled(isSigningIn)
+                .accessibilityIdentifier("grooSignIn.button")
             }
-            .disabled(isSigningIn)
-            .accessibilityIdentifier("grooSignIn.button")
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.canvas)
+    }
+
+    /// The native ceremony, with the hosted flow as the answer to everything it
+    /// cannot finish itself.
+    private func signInWithPasskey() {
+        isSigningIn = true
+        errorMessage = nil
+        Task {
+            do {
+                try await controller.signInWithPasskey(presentationAnchor: Self.presentationAnchor())
+                isSigningIn = false
+            } catch GrooAuthError.userCancelled {
+                isSigningIn = false
+            } catch GrooAuthError.passkeyUnavailable {
+                // Not an error to report. This device simply has no passkey for
+                // the issuer, which is the ordinary state of a device that has
+                // never enrolled one. Stop offering it and leave the person on
+                // the button that will work.
+                passkeyOffered = false
+                isSigningIn = false
+            } catch GrooAuthError.interactionRequired {
+                // The person proved their passkey and the issuer still needs a
+                // screen — consent, most often, and only ever once. Carrying
+                // straight on into the hosted flow is the only way forward, so
+                // it happens without making them tap again.
+                signIn()
+            } catch {
+                errorMessage = Self.message(for: error)
+                isSigningIn = false
+            }
+        }
     }
 
     private func signIn() {
@@ -121,8 +181,13 @@ public struct GrooSignInView: View {
              .invalidResponse(let detail),
              .idTokenInvalid(let detail):
             return detail
-        case .protocolError(let oauth):
+        case .protocolError(let oauth), .interactionRequired(let oauth):
             return oauth.errorDescription ?? oauth.error
+        case .passkeyUnavailable:
+            // Never rendered — the caller hides the button instead — but the
+            // switch must stay exhaustive, and a sentence is better than a crash
+            // if a future caller does show it.
+            return "No passkey is available on this device."
         }
     }
 

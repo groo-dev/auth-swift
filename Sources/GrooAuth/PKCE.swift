@@ -23,3 +23,19 @@ public enum PKCE {
             .replacingOccurrences(of: "=", with: "")
     }
 }
+
+extension Data {
+    /// Decodes base64url, which is what every WebAuthn field on the wire is.
+    ///
+    /// `Data(base64Encoded:)` refuses these strings outright: the alphabet
+    /// differs and the padding is gone, so both have to be put back first.
+    init?(base64URLEncoded string: String) {
+        var base64 = string
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = base64.count % 4
+        if remainder > 0 { base64 += String(repeating: "=", count: 4 - remainder) }
+        guard let data = Data(base64Encoded: base64) else { return nil }
+        self = data
+    }
+}

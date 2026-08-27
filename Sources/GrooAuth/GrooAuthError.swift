@@ -20,6 +20,24 @@ public enum GrooAuthError: Error, Sendable {
     case idTokenInvalid(String)
     case signedOut
     case userCancelled
+
+    /// This device holds no passkey for the issuer, or the platform declined to
+    /// run the ceremony.
+    ///
+    /// Separate from `userCancelled` because the two want opposite handling: a
+    /// cancellation means the person chose not to continue and the screen should
+    /// wait, while this means the method is simply not available here and the
+    /// password flow should be offered instead. Collapsing them into one case
+    /// forced every caller to guess which had happened.
+    case passkeyUnavailable
+
+    /// The issuer refused to complete a native sign-in and needs the person to be
+    /// shown something the app cannot render — a consent screen, a step-up
+    /// challenge, or an explanation that they have no access.
+    ///
+    /// Carries the issuer's own reason. Callers fall back to the hosted flow,
+    /// which is where those screens live.
+    case interactionRequired(OAuthProtocolError)
 }
 
 /// `errorDescription` deliberately surfaces the real underlying details (server
@@ -43,6 +61,10 @@ extension GrooAuthError: LocalizedError {
             return "You are signed out."
         case .userCancelled:
             return "Sign-in was cancelled."
+        case .passkeyUnavailable:
+            return "No passkey is available on this device."
+        case .interactionRequired(let error):
+            return "\(error.error): \(error.errorDescription ?? "")"
         }
     }
 }

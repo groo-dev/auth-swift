@@ -34,6 +34,7 @@ public actor GrooAuthSession {
     private let tokenStore: TokenStoring
     private let transport: HTTPTransporting
     private let webAuthenticator: WebAuthenticating
+    private let passkeyAuthenticator: PasskeyAuthenticating
     private let now: @Sendable () -> Date
 
     /// Cached discovery document — fetched at most once per session instance.
@@ -60,12 +61,14 @@ public actor GrooAuthSession {
         tokenStore: TokenStoring,
         transport: HTTPTransporting,
         webAuthenticator: WebAuthenticating,
+        passkeyAuthenticator: PasskeyAuthenticating = ASPasskeyAuthenticator(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.config = config
         self.tokenStore = tokenStore
         self.transport = transport
         self.webAuthenticator = webAuthenticator
+        self.passkeyAuthenticator = passkeyAuthenticator
         self.now = now
         self.pkceOverride = nil
     }
@@ -80,6 +83,7 @@ public actor GrooAuthSession {
             tokenStore: tokenStore,
             transport: URLSessionTransport(),
             webAuthenticator: ASWebAuthenticator(),
+            passkeyAuthenticator: ASPasskeyAuthenticator(),
             now: Date.init
         )
     }
@@ -91,6 +95,7 @@ public actor GrooAuthSession {
         tokenStore: TokenStoring,
         transport: HTTPTransporting,
         webAuthenticator: WebAuthenticating,
+        passkeyAuthenticator: PasskeyAuthenticating = ASPasskeyAuthenticator(),
         now: @escaping @Sendable () -> Date = Date.init,
         pkceOverride: PKCEOverride
     ) {
@@ -98,6 +103,7 @@ public actor GrooAuthSession {
         self.tokenStore = tokenStore
         self.transport = transport
         self.webAuthenticator = webAuthenticator
+        self.passkeyAuthenticator = passkeyAuthenticator
         self.now = now
         self.pkceOverride = pkceOverride
     }
@@ -338,54 +344,288 @@ public actor GrooAuthSession {
                 throw GrooAuthError.invalidResponse("callback URL is missing code")
             }
 
-            step = "token exchange"
-            GrooAuthLog.signin.notice("signIn: token exchange start")
-            let response = try await requestToken(parameters: [
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": config.redirectURI,
-                "client_id": config.clientId,
-                "code_verifier": verifier,
-            ])
-            step = "token exchange done"
-            GrooAuthLog.signin.notice("signIn: token exchange done")
-
-            step = "check id_token presence"
-            guard let idToken = response.id_token else {
-                throw GrooAuthError.invalidResponse("token response missing id_token")
-            }
-
-            step = "id_token verify"
-            GrooAuthLog.signin.notice("signIn: id_token verify start")
-            let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
-            step = "id_token verified"
-            // Claims are fine to log (post-verification, non-secret); the raw JWT never is.
-            GrooAuthLog.signin.notice("signIn: id_token verified sub=\(claims.sub, privacy: .public) iss=\(claims.iss, privacy: .public) aud=\(claims.aud, privacy: .public) exp=\(claims.exp, privacy: .public)")
-            let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
-
-            step = "building StoredTokens"
-            let stored = StoredTokens(
-                accessToken: response.access_token,
-                refreshToken: response.refresh_token,
-                tokenType: response.token_type,
-                expiresAt: now().addingTimeInterval(TimeInterval(response.expires_in)),
-                idToken: idToken,
-                scope: response.scope,
-                user: user
-            )
-            step = "tokenStore.save"
-            GrooAuthLog.signin.notice("signIn: tokenStore.save start")
-            try tokenStore.save(stored)
-            GrooAuthLog.signin.notice("signIn: tokenStore.save done")
-
-            step = "publish signedIn"
-            publish(.signedIn(user))
-            GrooAuthLog.signin.notice("signIn: published signedIn, returning user")
-            return user
+            step = "redeem code"
+            return try await redeemCode(code, verifier: verifier, nonce: nonce, doc: doc)
         } catch {
             GrooAuthLog.signin.error("signIn FAILED at step=\(step, privacy: .public): \(String(describing: error), privacy: .public)")
             throw error
         }
+    }
+
+    /// Signs in with a passkey, natively — no browser at any point.
+    ///
+    /// The ceremony is the platform's; everything after it is the same OAuth flow
+    /// `signIn` runs. The assertion buys a one-time ticket, the ticket buys one
+    /// trip through `/authorize`, and `/authorize` answers with a code exactly as
+    /// it does for a browser. That indirection is deliberate: the issuer decides
+    /// entitlement, consent and scope in ONE place, and a native sign-in that
+    /// minted its own code would be a second copy of those rules.
+    ///
+    /// Throws `.passkeyUnavailable` when this device holds no passkey for the
+    /// issuer, and `.interactionRequired` when the issuer needs to show something
+    /// this app cannot render — consent, a step-up challenge, or a refusal. Both
+    /// mean "use `signIn` instead", and neither is a failure worth alarming
+    /// anyone about.
+    public func signInWithPasskey(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
+        var step = "start"
+        GrooAuthLog.signin.notice("passkey: start")
+        do {
+            guard let relyingParty = config.issuer.host else {
+                throw GrooAuthError.invalidResponse("issuer has no host to use as a relying party: \(config.issuer)")
+            }
+
+            step = "loadDiscovery"
+            let doc = try await loadDiscovery()
+
+            step = "authentication options"
+            GrooAuthLog.signin.notice("passkey: requesting options rp=\(relyingParty, privacy: .public)")
+            let options = try await passkeyAuthenticationOptions()
+
+            step = "platform assertion"
+            GrooAuthLog.signin.notice("passkey: presenting platform sheet")
+            let assertion = try await passkeyAuthenticator.assert(
+                relyingPartyIdentifier: relyingParty,
+                challenge: options.challengeData,
+                allowedCredentialIDs: options.allowedCredentialIDs,
+                anchor: presentationAnchor
+            )
+
+            step = "verify assertion"
+            GrooAuthLog.signin.notice("passkey: assertion obtained, verifying")
+            let ticket = try await redeemAssertionForTicket(assertion, challenge: options.challenge)
+
+            let verifier: String
+            let state: String
+            let nonce: String
+            if let pkceOverride {
+                verifier = pkceOverride.verifier
+                state = pkceOverride.state
+                nonce = pkceOverride.nonce
+            } else {
+                verifier = PKCE.generateVerifier()
+                state = PKCE.randomURLSafe(byteCount: 16)
+                nonce = PKCE.randomURLSafe(byteCount: 16)
+            }
+
+            step = "authorize with ticket"
+            let code = try await authorizationCode(
+                ticket: ticket,
+                challenge: PKCE.challenge(for: verifier),
+                state: state,
+                nonce: nonce,
+                doc: doc
+            )
+
+            step = "redeem code"
+            return try await redeemCode(code, verifier: verifier, nonce: nonce, doc: doc)
+        } catch {
+            GrooAuthLog.signin.error("passkey FAILED at step=\(step, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw error
+        }
+    }
+
+    /// The server's `PublicKeyCredentialRequestOptionsJSON`, decoded far enough to
+    /// drive the platform sheet.
+    private struct PasskeyOptions {
+        let challenge: String
+        let challengeData: Data
+        let allowedCredentialIDs: [Data]
+    }
+
+    private struct OptionsEnvelope: Decodable {
+        struct Options: Decodable {
+            struct Credential: Decodable { let id: String }
+            let challenge: String
+            let allowCredentials: [Credential]?
+        }
+        let options: Options
+    }
+
+    private func passkeyAuthenticationOptions() async throws -> PasskeyOptions {
+        var request = URLRequest(url: config.issuer.appendingPathComponent("v1/auth/passkey/authenticate/options"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, http) = try await transport.send(request)
+        guard (200..<300).contains(http.statusCode) else {
+            throw GrooAuthError.transport("passkey options failed with HTTP \(http.statusCode)")
+        }
+        let envelope: OptionsEnvelope
+        do {
+            envelope = try JSONDecoder().decode(OptionsEnvelope.self, from: data)
+        } catch {
+            throw GrooAuthError.invalidResponse("passkey options were not the expected shape: \(error)")
+        }
+        guard let challengeData = Data(base64URLEncoded: envelope.options.challenge) else {
+            throw GrooAuthError.invalidResponse("passkey challenge is not valid base64url")
+        }
+        return PasskeyOptions(
+            challenge: envelope.options.challenge,
+            challengeData: challengeData,
+            // A sign-in names no credentials — the person has not said who they
+            // are, so any passkey for this relying party may answer.
+            allowedCredentialIDs: (envelope.options.allowCredentials ?? []).compactMap {
+                Data(base64URLEncoded: $0.id)
+            }
+        )
+    }
+
+    private struct TicketEnvelope: Decodable { let authTicket: String }
+
+    private func redeemAssertionForTicket(_ assertion: PasskeyAssertion, challenge: String) async throws -> String {
+        var response: [String: Any] = [
+            "id": assertion.credentialID,
+            "rawId": assertion.credentialID,
+            "type": "public-key",
+            "clientExtensionResults": [:] as [String: Any],
+            "response": [
+                "clientDataJSON": assertion.clientDataJSON,
+                "authenticatorData": assertion.authenticatorData,
+                "signature": assertion.signature,
+            ] as [String: Any],
+        ]
+        if let userHandle = assertion.userHandle, var inner = response["response"] as? [String: Any] {
+            inner["userHandle"] = userHandle
+            response["response"] = inner
+        }
+
+        var request = URLRequest(url: config.issuer.appendingPathComponent("v1/auth/passkey/authenticate/verify"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "response": response,
+            "challenge": challenge,
+            "client_id": config.clientId,
+            "redirect_uri": config.redirectURI,
+            "native_auth_ticket": true,
+        ])
+
+        let (data, http) = try await transport.send(request)
+        guard (200..<300).contains(http.statusCode) else {
+            // The issuer's own words: "Your account is pending approval" and
+            // "Authentication failed" both matter to the person and neither is
+            // something this SDK can say better.
+            if let oauth = try? OAuthProtocolError.decode(data) {
+                throw GrooAuthError.protocolError(oauth)
+            }
+            throw GrooAuthError.transport("passkey verification failed with HTTP \(http.statusCode)")
+        }
+        guard let envelope = try? JSONDecoder().decode(TicketEnvelope.self, from: data) else {
+            // A step-up answer lands here: it is a 200 carrying stepUpToken rather
+            // than a ticket, and it needs a screen this app does not have.
+            throw GrooAuthError.interactionRequired(OAuthProtocolError(
+                error: "interaction_required",
+                errorDescription: "this sign-in needs to be completed in a browser"
+            ))
+        }
+        return envelope.authTicket
+    }
+
+    /// Spends the ticket at `/authorize` and reads the code out of the redirect.
+    private func authorizationCode(
+        ticket: String,
+        challenge: String,
+        state: String,
+        nonce: String,
+        doc: DiscoveryDocument
+    ) async throws -> String {
+        guard var components = URLComponents(url: doc.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
+            throw GrooAuthError.invalidResponse("authorization_endpoint is not a valid URL: \(doc.authorizationEndpoint)")
+        }
+        components.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: config.clientId),
+            URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+            URLQueryItem(name: "scope", value: config.scopeString),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "nonce", value: nonce),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "auth_ticket", value: ticket),
+        ]
+        guard let url = components.url else {
+            throw GrooAuthError.invalidResponse("failed to construct authorization URL")
+        }
+
+        let (_, http) = try await transport.sendWithoutFollowingRedirects(URLRequest(url: url))
+        guard let location = http.value(forHTTPHeaderField: "Location") else {
+            // Anything but a redirect means the request was refused before it
+            // reached the point of having somewhere to send us.
+            throw GrooAuthError.invalidResponse("authorize answered HTTP \(http.statusCode) with no Location")
+        }
+        guard let redirect = URLComponents(string: location) else {
+            throw GrooAuthError.invalidResponse("authorize returned an unreadable Location")
+        }
+        let items = redirect.queryItems ?? []
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+
+        if let error = value("error") {
+            let oauth = OAuthProtocolError(error: error, errorDescription: value("error_description"))
+            // The issuer needs to show a screen — consent, step-up, no access.
+            // Distinct from a protocol error so the caller knows the hosted flow
+            // will succeed where this one could not.
+            if error == "interaction_required" || error == "access_denied" {
+                throw GrooAuthError.interactionRequired(oauth)
+            }
+            throw GrooAuthError.protocolError(oauth)
+        }
+        guard let returnedState = value("state"), returnedState == state else {
+            throw GrooAuthError.stateMismatch
+        }
+        guard let code = value("code") else {
+            // A redirect somewhere that is not the callback — a login or consent
+            // page — is the issuer asking for a browser.
+            throw GrooAuthError.interactionRequired(OAuthProtocolError(
+                error: "interaction_required",
+                errorDescription: "the issuer needs this sign-in completed in a browser"
+            ))
+        }
+        return code
+    }
+
+    /// Everything after an authorization code is in hand: exchange it, verify the
+    /// `id_token`, store the tokens, publish.
+    ///
+    /// Shared by `signIn` and `signInWithPasskey`, which differ ONLY in how the
+    /// code was obtained — one through a browser, one through a platform
+    /// assertion. Duplicating the tail would mean two places to get token storage
+    /// and `id_token` verification right.
+    private func redeemCode(_ code: String, verifier: String, nonce: String, doc: DiscoveryDocument) async throws -> GrooUser {
+        GrooAuthLog.signin.notice("redeemCode: token exchange start")
+        let response = try await requestToken(parameters: [
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": config.redirectURI,
+            "client_id": config.clientId,
+            "code_verifier": verifier,
+        ])
+        GrooAuthLog.signin.notice("redeemCode: token exchange done")
+
+        guard let idToken = response.id_token else {
+            throw GrooAuthError.invalidResponse("token response missing id_token")
+        }
+
+        GrooAuthLog.signin.notice("redeemCode: id_token verify start")
+        let claims = try await verifyIDTokenSelfHealing(idToken, doc: doc, nonce: nonce)
+        // Claims are fine to log (post-verification, non-secret); the raw JWT never is.
+        GrooAuthLog.signin.notice("redeemCode: id_token verified sub=\(claims.sub, privacy: .public) iss=\(claims.iss, privacy: .public) aud=\(claims.aud, privacy: .public) exp=\(claims.exp, privacy: .public)")
+        let user = GrooUser(sub: claims.sub, email: claims.email, name: claims.name)
+
+        let stored = StoredTokens(
+            accessToken: response.access_token,
+            refreshToken: response.refresh_token,
+            tokenType: response.token_type,
+            expiresAt: now().addingTimeInterval(TimeInterval(response.expires_in)),
+            idToken: idToken,
+            scope: response.scope,
+            user: user
+        )
+        GrooAuthLog.signin.notice("redeemCode: tokenStore.save start")
+        try tokenStore.save(stored)
+        GrooAuthLog.signin.notice("redeemCode: tokenStore.save done")
+
+        publish(.signedIn(user))
+        GrooAuthLog.signin.notice("redeemCode: published signedIn, returning user")
+        return user
     }
 
     /// Verifies `idToken` against the cached JWKS, self-healing exactly once if
