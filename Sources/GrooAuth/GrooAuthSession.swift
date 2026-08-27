@@ -471,6 +471,85 @@ public actor GrooAuthSession {
         }
     }
 
+    /// Creates a passkey on this device and registers it with the issuer.
+    ///
+    /// The one account action a web console cannot do for someone: a passkey is
+    /// bound to the authenticator that made it, so a browser elsewhere cannot
+    /// enrol this phone.
+    ///
+    /// Both endpoints are step-up gated — adding a credential that can
+    /// authenticate the account outright is as sensitive as changing a password —
+    /// so this throws `.insufficientScope` when the scope is missing and
+    /// `.protocolError` carrying the issuer's own refusal when the sign-in is too
+    /// old. Callers should offer a fresh sign-in rather than retrying.
+    ///
+    /// - Parameter name: what the passkey is called in the account's list. The
+    ///   issuer picks a device label when this is nil.
+    @discardableResult
+    public func registerPasskey(name: String? = nil, presentationAnchor: ASPresentationAnchor) async throws -> Bool {
+        guard let relyingParty = config.issuer.host else {
+            throw GrooAuthError.invalidResponse("issuer has no host to use as a relying party: \(config.issuer)")
+        }
+        guard let tokens = try tokenStore.load(), let user = tokens.user else {
+            throw GrooAuthError.signedOut
+        }
+
+        struct OptionsWire: Decodable {
+            struct Options: Decodable {
+                struct User: Decodable { let id: String; let name: String? }
+                let challenge: String
+                let user: User
+            }
+            let options: Options
+        }
+
+        let optionsData = try await accountRequest(path: "v1/account/passkeys/register/options", method: "POST")
+        guard let wire = try? JSONDecoder().decode(OptionsWire.self, from: optionsData) else {
+            throw GrooAuthError.invalidResponse("passkey registration options were not the expected shape")
+        }
+        guard let challenge = Data(base64URLEncoded: wire.options.challenge) else {
+            throw GrooAuthError.invalidResponse("passkey challenge is not valid base64url")
+        }
+        // The server's own user handle, not the `sub` reformatted here. WebAuthn
+        // stores these bytes verbatim and a later assertion is matched against
+        // them, so inventing an encoding produces a credential the server cannot
+        // recognise — and it fails at sign-in, not here.
+        guard let userID = Data(base64URLEncoded: wire.options.user.id) else {
+            throw GrooAuthError.invalidResponse("passkey user handle is not valid base64url")
+        }
+
+        let created = try await passkeyAuthenticator.register(
+            relyingPartyIdentifier: relyingParty,
+            challenge: challenge,
+            userID: userID,
+            userName: wire.options.user.name ?? user.email ?? user.sub,
+            anchor: presentationAnchor
+        )
+
+        var body: [String: Any] = [
+            "challenge": wire.options.challenge,
+            "response": [
+                "id": created.credentialID,
+                "rawId": created.credentialID,
+                "type": "public-key",
+                "clientExtensionResults": [:] as [String: Any],
+                "response": [
+                    "clientDataJSON": created.clientDataJSON,
+                    "attestationObject": created.attestationObject,
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+        if let name { body["name"] = name }
+
+        _ = try await accountRequest(
+            path: "v1/account/passkeys/register/verify",
+            method: "POST",
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        GrooAuthLog.signin.notice("registerPasskey: registered")
+        return true
+    }
+
     /// The server's `PublicKeyCredentialRequestOptionsJSON`, decoded far enough to
     /// drive the platform sheet.
     private struct PasskeyOptions {

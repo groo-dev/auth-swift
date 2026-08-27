@@ -33,6 +33,19 @@ public struct PasskeyAssertion: Sendable, Equatable {
     }
 }
 
+/// One newly created passkey, in the shape the server's WebAuthn verifier expects.
+public struct PasskeyRegistration: Sendable, Equatable {
+    public let credentialID: String
+    public let clientDataJSON: String
+    public let attestationObject: String
+
+    public init(credentialID: String, clientDataJSON: String, attestationObject: String) {
+        self.credentialID = credentialID
+        self.clientDataJSON = clientDataJSON
+        self.attestationObject = attestationObject
+    }
+}
+
 /// Abstraction over `ASAuthorizationController`, for the same reason
 /// `WebAuthenticating` abstracts `ASWebAuthenticationSession`: the ceremony needs
 /// a real authenticator and a window server, so the flow around it is what tests
@@ -51,6 +64,24 @@ public protocol PasskeyAuthenticating: Sendable {
         allowedCredentialIDs: [Data],
         anchor: ASPresentationAnchor
     ) async throws -> PasskeyAssertion
+
+    /// Creates a passkey on THIS device.
+    ///
+    /// The one account action a web console genuinely cannot perform on someone's
+    /// behalf: a passkey is bound to the authenticator that made it, so a browser
+    /// on a laptop cannot enrol a phone.
+    ///
+    /// - Parameters:
+    ///   - userID: the account's `sub`, as raw bytes.
+    ///   - userName: what the platform shows in its sheet and later in the
+    ///     password manager — an email, normally.
+    func register(
+        relyingPartyIdentifier: String,
+        challenge: Data,
+        userID: Data,
+        userName: String,
+        anchor: ASPresentationAnchor
+    ) async throws -> PasskeyRegistration
 }
 
 #if canImport(AuthenticationServices) && !os(watchOS) && !os(tvOS)
@@ -80,19 +111,48 @@ public final class ASPasskeyAuthenticator: PasskeyAuthenticating, @unchecked Sen
                         ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0)
                     }
                 }
-
-                let controller = ASAuthorizationController(authorizationRequests: [request])
-                let delegate = PasskeyDelegate(anchor: anchor, continuation: continuation)
-                controller.delegate = delegate
-                controller.presentationContextProvider = delegate
-                // The controller does not retain its delegate, and the delegate is
-                // the only thing holding the continuation. Without this the whole
-                // pair is deallocated at the end of this closure and the caller
-                // waits forever.
-                delegate.controller = controller
-                controller.performRequests()
+                Self.present(request, anchor: anchor, continuation: PasskeyDelegate.Outcome.assertion(continuation))
             }
         }
+    }
+
+    public func register(
+        relyingPartyIdentifier: String,
+        challenge: Data,
+        userID: Data,
+        userName: String,
+        anchor: ASPresentationAnchor
+    ) async throws -> PasskeyRegistration {
+        try await withCheckedThrowingContinuation { continuation in
+            Task { @MainActor in
+                let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
+                    relyingPartyIdentifier: relyingPartyIdentifier
+                )
+                let request = provider.createCredentialRegistrationRequest(
+                    challenge: challenge,
+                    name: userName,
+                    userID: userID
+                )
+                Self.present(request, anchor: anchor, continuation: PasskeyDelegate.Outcome.registration(continuation))
+            }
+        }
+    }
+
+    @MainActor
+    private static func present(
+        _ request: ASAuthorizationRequest,
+        anchor: ASPresentationAnchor,
+        continuation: PasskeyDelegate.Outcome
+    ) {
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        let delegate = PasskeyDelegate(anchor: anchor, outcome: continuation)
+        controller.delegate = delegate
+        controller.presentationContextProvider = delegate
+        // The controller does not retain its delegate, and the delegate is the
+        // only thing holding the continuation. Without this the whole pair is
+        // deallocated at the end of this closure and the caller waits forever.
+        delegate.controller = controller
+        controller.performRequests()
     }
 }
 
@@ -102,27 +162,60 @@ public final class ASPasskeyAuthenticator: PasskeyAuthenticating, @unchecked Sen
 private final class PasskeyDelegate: NSObject, ASAuthorizationControllerDelegate,
     ASAuthorizationControllerPresentationContextProviding
 {
+    /// Which ceremony is in flight. The two differ only in what the platform
+    /// hands back, and the failure handling below is identical — so it is written
+    /// once and this says who to resume.
+    enum Outcome {
+        case assertion(CheckedContinuation<PasskeyAssertion, Error>)
+        case registration(CheckedContinuation<PasskeyRegistration, Error>)
+    }
+
     private let anchor: ASPresentationAnchor
-    private var continuation: CheckedContinuation<PasskeyAssertion, Error>?
+    private var outcome: Outcome?
     var controller: ASAuthorizationController?
-    /// Retains self until a callback fires — see `ASPasskeyAuthenticator.assert`.
+    /// Retains self until a callback fires — see `ASPasskeyAuthenticator.present`.
     private var selfRetain: PasskeyDelegate?
 
-    init(anchor: ASPresentationAnchor, continuation: CheckedContinuation<PasskeyAssertion, Error>) {
+    init(anchor: ASPresentationAnchor, outcome: Outcome) {
         self.anchor = anchor
-        self.continuation = continuation
+        self.outcome = outcome
         super.init()
         self.selfRetain = self
     }
 
     /// A `CheckedContinuation` traps if resumed twice, so finishing is funnelled
     /// through here rather than trusting the framework to call back exactly once.
-    private func finish(_ result: Result<PasskeyAssertion, Error>) {
-        guard let continuation else { return }
-        self.continuation = nil
+    private func finish(_ error: Error) {
+        guard let outcome else { return }
+        release()
+        switch outcome {
+        case .assertion(let c): c.resume(throwing: error)
+        case .registration(let c): c.resume(throwing: error)
+        }
+    }
+
+    private func finish(_ assertion: PasskeyAssertion) {
+        guard case .assertion(let c) = outcome else {
+            finish(GrooAuthError.invalidResponse("the platform answered a registration with an assertion"))
+            return
+        }
+        release()
+        c.resume(returning: assertion)
+    }
+
+    private func finish(_ registration: PasskeyRegistration) {
+        guard case .registration(let c) = outcome else {
+            finish(GrooAuthError.invalidResponse("the platform answered an assertion with a registration"))
+            return
+        }
+        release()
+        c.resume(returning: registration)
+    }
+
+    private func release() {
+        outcome = nil
         controller = nil
         selfRetain = nil
-        continuation.resume(with: result)
     }
 
     func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor { anchor }
@@ -131,30 +224,39 @@ private final class PasskeyDelegate: NSObject, ASAuthorizationControllerDelegate
         controller: ASAuthorizationController,
         didCompleteWithAuthorization authorization: ASAuthorization
     ) {
-        guard
-            let assertion = authorization.credential
-                as? ASAuthorizationPlatformPublicKeyCredentialAssertion
-        else {
-            finish(.failure(GrooAuthError.invalidResponse(
-                "passkey sign-in returned \(type(of: authorization.credential)), not a platform assertion"
-            )))
+        if let assertion = authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialAssertion {
+            guard let signature = assertion.signature else {
+                finish(GrooAuthError.invalidResponse("passkey assertion carried no signature"))
+                return
+            }
+            guard let authenticatorData = assertion.rawAuthenticatorData else {
+                finish(GrooAuthError.invalidResponse("passkey assertion carried no authenticator data"))
+                return
+            }
+            finish(PasskeyAssertion(
+                credentialID: PKCE.base64URL(assertion.credentialID),
+                clientDataJSON: PKCE.base64URL(assertion.rawClientDataJSON),
+                authenticatorData: PKCE.base64URL(authenticatorData),
+                signature: PKCE.base64URL(signature),
+                userHandle: assertion.userID.map { PKCE.base64URL($0) }
+            ))
             return
         }
-        guard let signature = assertion.signature else {
-            finish(.failure(GrooAuthError.invalidResponse("passkey assertion carried no signature")))
+        if let created = authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialRegistration {
+            guard let attestation = created.rawAttestationObject else {
+                finish(GrooAuthError.invalidResponse("new passkey carried no attestation object"))
+                return
+            }
+            finish(PasskeyRegistration(
+                credentialID: PKCE.base64URL(created.credentialID),
+                clientDataJSON: PKCE.base64URL(created.rawClientDataJSON),
+                attestationObject: PKCE.base64URL(attestation)
+            ))
             return
         }
-        guard let authenticatorData = assertion.rawAuthenticatorData else {
-            finish(.failure(GrooAuthError.invalidResponse("passkey assertion carried no authenticator data")))
-            return
-        }
-        finish(.success(PasskeyAssertion(
-            credentialID: PKCE.base64URL(assertion.credentialID),
-            clientDataJSON: PKCE.base64URL(assertion.rawClientDataJSON),
-            authenticatorData: PKCE.base64URL(authenticatorData),
-            signature: PKCE.base64URL(signature),
-            userHandle: assertion.userID.map { PKCE.base64URL($0) }
-        )))
+        finish(GrooAuthError.invalidResponse(
+            "the platform returned \(type(of: authorization.credential)), which is neither ceremony's credential"
+        ))
     }
 
     func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
@@ -165,12 +267,12 @@ private final class PasskeyDelegate: NSObject, ASAuthorizationControllerDelegate
         // never enrolled one, and the caller offers the password flow instead.
         switch code {
         case .canceled:
-            finish(.failure(GrooAuthError.userCancelled))
+            finish(GrooAuthError.userCancelled)
         case .notHandled, .failed:
-            finish(.failure(GrooAuthError.passkeyUnavailable))
+            finish(GrooAuthError.passkeyUnavailable)
         default:
-            GrooAuthLog.web.error("passkey assertion failed: \(error.localizedDescription, privacy: .public)")
-            finish(.failure(GrooAuthError.transport(error.localizedDescription)))
+            GrooAuthLog.web.error("passkey ceremony failed: \(error.localizedDescription, privacy: .public)")
+            finish(GrooAuthError.transport(error.localizedDescription))
         }
     }
 }
