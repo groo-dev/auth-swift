@@ -224,10 +224,40 @@ Two things learned:
 
 ---
 
-### Task 6: the account list sections — NOT STARTED
+### Task 6: the account list sections — DONE
 
-Passkeys, devices, connected apps, tokens. Blocked on the two data prerequisites
-below, which are real for these and were not for the profile.
+Shipped as 0.4.0, then 0.4.1. Passkeys, devices, connected apps and tokens, plus
+native passkey REGISTRATION — the one account action a console cannot perform for
+a device, since a passkey is bound to the authenticator that made it. Creating an
+API token is deliberately absent: a token is shown once and has to be copied
+somewhere safe, which is a desk job.
+
+**The prerequisite was a scope-model decision, not a data change.** These four
+scopes could not be granted to a native app at all: attributing them to an
+application would have recorded "manage your passkeys" against Pass or Azan, and
+`check-no-shared-scopes` would then have forbidden a second application from
+offering the same account screen. They are now GLOBAL, alongside
+`accounts:profile`, with the consequence that the consent screen lists them in the
+block that says they cannot be turned off. That was the user's call, taken
+knowingly (`runtime` commit 824351b).
+
+The app picks its sections; the scopes derive from that choice, so the two cannot
+drift. `bt/space` and `gr/ios` both show passkeys, devices and connected apps and
+neither requests `accounts:tokens` — visible on the live consent screen, which is
+the property working.
+
+Three things learned:
+
+- **`GrooAccountSections` belongs to `GrooAuth`, not `GrooAuthUI`.** It builds a
+  config, and in `gr/ios` that construction is shared with an AutoFill extension
+  that must never link SwiftUI. A type that forces the wrong module on a caller is
+  the wrong type wherever it feels like it belongs.
+- **A gate that keeps its own copy of a list will report a violation that is not
+  one.** `check-no-shared-scopes` did exactly that, while printing "fix the data"
+  at data that was right. It reads the real list now, with a canary.
+- **`ISO8601DateFormatter` refuses the timestamps this issuer sends.** It returns
+  nil for milliseconds, which would have dropped the "last used" line off every
+  row with no error anywhere.
 
 ---
 
