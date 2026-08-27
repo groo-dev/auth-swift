@@ -144,20 +144,47 @@ Two things learned while verifying, both worth knowing before Task 4:
 
 ---
 
-### Task 4: Passkey sign-in
+### Task 4: Passkey sign-in — DONE
 
 **Files:** Modify `Sources/GrooAuthUI/GrooSignInView.swift`; create
 `Sources/GrooAuthUI/PasskeyAuthenticator.swift`.
 
-- [ ] `ASAuthorizationPlatformPublicKeyCredentialProvider` against
+- [x] `ASAuthorizationPlatformPublicKeyCredentialProvider` against
       `/v1/auth/passkey/authenticate/options` then `/verify`.
-- [ ] The relying party is the issuer host, from `GrooAuthConfig.issuer`. Never a
+- [x] The relying party is the issuer host, from `GrooAuthConfig.issuer`. Never a
       literal.
-- [ ] Offer the passkey button only when one may exist; fall back silently to
+- [x] Offer the passkey button only when one may exist; fall back silently to
       password when the platform has none.
-- [ ] **Test on a device**, not the simulator. Verify against BOTH apps, since
+- [x] **Test on a device**, not the simulator. Verify against BOTH apps, since
       each has its own bundle and therefore its own AASA entry.
-- [ ] Document the two silent prerequisites in the README.
+- [x] Document the two silent prerequisites in the README.
+
+**Shipped as 0.2.0, and it needed the API to change.** The plan assumed
+`/v1/auth/passkey/authenticate/verify` could hand an app what it needs. It cannot:
+it answers with a session cookie and a user object, and an app can use neither.
+
+Minting a code in the passkey route was refused — `/authorize` is ~270 lines
+deciding scope attribution, per-application ceilings, resource indicators,
+max_age, AAL, entitlement and consent, and a second copy of that is the copy that
+drifts. Instead the assertion buys a one-time ticket and the ticket buys one trip
+through `/authorize`, so every gate runs where it already ran. See
+`runtime` commits 3ab7a05 and 54ce23a.
+
+Verified end to end against production in `gr/ios`, Release, with a passkey
+enrolled for `e2e@groo.dev`: platform sheet → assertion → ticket → code → tokens,
+no browser at any point. `bt/space` is verified as far as the workspace allows —
+button, ceremony, platform sheet — but no passkey has been enrolled for
+`me.groo.space` on this machine and there is no account here to enrol one with.
+
+Two things learned, both recorded in `runtime/docs/PENDING.md`:
+
+- A global scope added to a client AFTER consent was granted invalidates every
+  existing consent row for that application, because a global joins every
+  application's wanted set. `offline_access` did exactly this to a live account,
+  and the symptom is a consent screen nobody expected.
+- The passkey button is offered until an attempt reports `passkeyUnavailable`,
+  then hidden. There is no way to ASK the platform whether a credential exists —
+  it answers only by running the ceremony.
 
 ---
 
