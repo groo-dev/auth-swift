@@ -188,11 +188,46 @@ Two things learned, both recorded in `runtime/docs/PENDING.md`:
 
 ---
 
-### Task 5: `GrooUserButton` and the account shell
+### Task 5: `GrooUserButton` and the account shell — DONE (profile)
 
-Blocked on the two data prerequisites below. Sections: profile, security
-(passkeys, devices), connected apps, tokens, danger. Each list is an
-`@Observable` store over the existing `/v1/account/*` endpoints.
+Shipped as 0.3.0, then 0.3.1. `GrooUserButton` → `GrooAccountView`: identity,
+an editable name and phone over `/v1/account/profile`, a link to the console, and
+sign-out. `GrooAccountStore` is the `@Observable` behind it;
+`GrooAuthSession.accountRequest` is the seam, so the transport and the issuer stay
+where they already live.
+
+**Neither data prerequisite was needed.** `accounts:profile` is a GLOBAL scope and
+was already inside every application's ceiling — the shell only needed the apps to
+REQUEST it. The prerequisites are still real for the list sections below, which
+want `accounts:passkeys|devices|apps|tokens`, and those are not global.
+
+The lists are deliberately NOT native. Each needs destructive actions on rows, and
+a half-built one is worse for the person than a link to the console that works.
+`consoleURL` is that link; `nil` hides it.
+
+**0.3.1 exists because building this exposed an older bug.** `GrooUser.email` and
+`.name` had been nil for every client since the beginning: this issuer's
+`id_token` carries `sub`, `auth_time`, `nonce` and `amr` and nothing else, which
+is what OIDC Core 5.4 prescribes for a code flow, and the SDK never called
+UserInfo. The account card rendered "?" and "Your Account" — and `bt/space` had
+been passing a nil email to RevenueCat all along.
+
+Two things learned:
+
+- **A theme belongs at the app root, not on each screen.** `gr/ios` set it inside
+  `SignInScreen`; the account card added later came out green in a violet app. It
+  is now set once in `GrooApp`, and the snapshot tests supply it because they
+  render outside that root.
+- **Adding any scope re-prompts every existing user for consent**, and until they
+  approve, the native passkey path falls back to the hosted flow. Both are correct
+  and both look like faults if you do not expect them.
+
+---
+
+### Task 6: the account list sections — NOT STARTED
+
+Passkeys, devices, connected apps, tokens. Blocked on the two data prerequisites
+below, which are real for these and were not for the profile.
 
 ---
 
