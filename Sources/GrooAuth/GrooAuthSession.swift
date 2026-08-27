@@ -352,6 +352,53 @@ public actor GrooAuthSession {
         }
     }
 
+    /// Calls the issuer's `/v1/account/*` surface with a valid access token.
+    ///
+    /// The account API lives at the issuer, not at any product's API, and it is
+    /// Bearer-only by design — cookies and PATs are refused there, which is what
+    /// keeps it CSRF-immune. This method exists so `GrooAuthUI` can reach it
+    /// without being handed the transport or being told how a token is obtained;
+    /// the token is refreshed if near expiry, exactly as `accessToken()` does.
+    ///
+    /// Returns the raw body. Decoding belongs to the caller, which knows what it
+    /// asked for.
+    ///
+    /// - Parameter path: relative to the issuer, e.g. `v1/account/profile`.
+    public func accountRequest(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+        let token = try await accessToken()
+        var request = URLRequest(url: config.issuer.appendingPathComponent(path))
+        request.httpMethod = method
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+
+        let (data, http) = try await transport.send(request)
+        if (200..<300).contains(http.statusCode) { return data }
+
+        let message = (try? OAuthProtocolError.decode(data))?.error
+        // The 403 this surface returns when a scope is missing names the scope,
+        // and that specific failure has a specific fix — approve it at the next
+        // sign-in. Pulling the name out here means the app does not have to parse
+        // an error string to say something true.
+        if http.statusCode == 403, let message, let scope = Self.missingScope(in: message) {
+            throw GrooAuthError.insufficientScope(scope)
+        }
+        throw GrooAuthError.protocolError(OAuthProtocolError(
+            error: message ?? "account request failed with HTTP \(http.statusCode)",
+            errorDescription: nil
+        ))
+    }
+
+    /// Pulls `accounts:profile` out of `missing required scope "accounts:profile"`.
+    static func missingScope(in message: String) -> String? {
+        guard message.contains("scope") else { return nil }
+        let parts = message.split(separator: "\"")
+        guard parts.count >= 2 else { return nil }
+        return String(parts[1])
+    }
+
     /// Signs in with a passkey, natively — no browser at any point.
     ///
     /// The ceremony is the platform's; everything after it is the same OAuth flow

@@ -143,6 +143,33 @@ credentials.
 The relying party is always derived from `GrooAuthConfig.issuer`, never written
 down as a literal — a hardcoded host would work for exactly one workspace.
 
+### 3c. The account screen
+
+`GrooUserButton` opens `GrooAccountView`: who you are signed in as, an editable
+name and phone, a link to the hosted console, and sign-out.
+
+```swift
+GrooUserButton(
+    controller: controller,
+    consoleURL: URL(string: "https://me.groo.dev/account"),
+    showsLabel: true   // avatar + name + email, for a settings row
+)
+```
+
+**Requires the `accounts:profile` scope.** Add it to `GrooAuthConfig.scopes`; it
+is a global scope, so it is granted per request rather than per application. Note
+that adding ANY scope a client did not previously request means every existing
+user is asked to approve again at their next sign-in — there is no way to widen a
+grant silently, and that is the point.
+
+Without it, `/v1/account/profile` answers 403 and the screen says which scope is
+missing rather than showing an empty form.
+
+Passkeys, devices, connected apps and API tokens are deliberately NOT native.
+Each is a list with its own destructive actions, and a half-built version of one
+is worse than an honest link to the finished one — which is what `consoleURL` is.
+Pass `nil` to hide the link entirely.
+
 ### 4. Call your APIs
 
 `accessToken()` returns a valid bearer token, refreshing transparently if it is near expiry:
@@ -196,7 +223,7 @@ case .clearedButRevokeFailed(let reason):
 
 | Type | Role |
 |---|---|
-| `GrooAuthSession` (`actor`) | The entry point — `signIn`, `signInWithPasskey`, `signOut`, `accessToken`, `forceRefreshAccessToken`, `currentState`, `stateStream`. |
+| `GrooAuthSession` (`actor`) | The entry point — `signIn`, `signInWithPasskey`, `signOut`, `accessToken`, `forceRefreshAccessToken`, `accountRequest`, `currentState`, `stateStream`. |
 | `GrooAuthConfig` | Issuer, client ID, redirect URI, scopes, keychain service/access group. |
 | `GrooUser` | `sub`, `email`, `name` from the verified ID token. |
 | `GrooAuthState` | `.signedOut` / `.signedIn(GrooUser)`. |
@@ -208,6 +235,10 @@ case .clearedButRevokeFailed(let reason):
 | `WebAuthenticating` | Protocol over `ASWebAuthenticationSession` (inject a fake in tests). |
 | `PasskeyAuthenticating` | Protocol over `ASAuthorizationController` (inject a fake in tests). |
 | `PasskeyAssertion` | One passkey assertion, base64url, as the server's verifier expects. |
+| `GrooUserButton` | Avatar button that opens the account screen. |
+| `GrooAccountView` | The account screen itself, if you want to present it yourself. |
+| `GrooAccountStore` | `@Observable` profile load/save over `/v1/account/profile`. |
+| `GrooAvatar` | The initials circle, on its own. |
 
 ## Error handling
 
@@ -224,6 +255,7 @@ case .clearedButRevokeFailed(let reason):
 | `.signedOut` | No valid session (e.g. refresh token expired/revoked). |
 | `.passkeyUnavailable` | No passkey on this device for the issuer. Offer `signIn`. |
 | `.interactionRequired(OAuthProtocolError)` | The issuer needs a screen the app has none of. Fall back to `signIn`. |
+| `.insufficientScope(String)` | The token lacks a scope the request needs, and names it. |
 
 ## Sharing tokens with an app extension
 
