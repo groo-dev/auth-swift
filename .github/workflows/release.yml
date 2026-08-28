@@ -6,6 +6,10 @@ on:
 
 permissions:
   contents: write
+  # Turns on GitHub deployment markers. record-release discovers the
+  # capability by attempting the call, so this line is the entire opt-in --
+  # without it the action logs a notice and records the release anyway.
+  deployments: write
 
 jobs:
   release:
