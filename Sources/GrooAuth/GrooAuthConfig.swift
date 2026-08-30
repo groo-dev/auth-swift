@@ -30,6 +30,20 @@ public enum GrooAuthState: Sendable, Equatable {
 }
 
 public enum SignOutResult: Sendable, Equatable {
+    /// Tokens revoked, local storage cleared, and the issuer's browser session
+    /// ended. The only outcome after which the next `signIn` is guaranteed to
+    /// ask who you are.
     case revokedAndCleared
     case clearedButRevokeFailed(reason: String)
+    /// Tokens were revoked and cleared, but the ISSUER'S BROWSER SESSION IS STILL
+    /// LIVE — so the next `signIn` may complete with no prompt at all, as the
+    /// same person, from the cookie the system browser still holds.
+    ///
+    /// This is a distinct case rather than a `clearedButRevokeFailed` reason
+    /// because the consequence is different in kind. A failed revoke leaves a
+    /// token alive somewhere the person cannot see; this leaves *the account*
+    /// reachable on this device, one tap away, by whoever holds the phone next.
+    /// On a shared device that is the more serious of the two, and a caller that
+    /// wants to warn about it needs to be able to tell them apart.
+    case clearedButBrowserSessionLive(reason: String)
 }

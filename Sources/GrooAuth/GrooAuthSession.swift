@@ -868,7 +868,41 @@ public actor GrooAuthSession {
     /// upgraded to `.revokedAndCleared`, which would misreport a revoke that
     /// never happened). Only a real nil (no error, no tokens) keeps the
     /// "nothing to revoke" `.revokedAndCleared` outcome.
-    public func signOut() async -> SignOutResult {
+    ///
+    /// ═══ IT ALSO ENDS THE ISSUER'S BROWSER SESSION, AND THAT IS THE POINT ═══
+    ///
+    /// Revoking the refresh token and clearing the keychain signs this APP out.
+    /// It does not touch the cookie the system browser holds for the issuer, and
+    /// `ASWebAuthenticationSession` runs non-ephemeral precisely so that cookie
+    /// is shared. Measured live against `me.groo.dev` on 2026-08-31, with the
+    /// session cookie present and consent already granted:
+    ///
+    ///     GET /v1/oauth/authorize?...
+    ///       -> 302 dev.groo.ios://oauth-callback?code=...
+    ///
+    /// No login screen, no consent screen, no account picker. So "Sign Out"
+    /// followed by "Sign In" silently returned the SAME person — and on a shared
+    /// device, returned the previous person's account to whoever tapped next.
+    /// After `GET /v1/auth/logout` the identical request answers:
+    ///
+    ///     -> 302 https://me.groo.dev/login?continue=...
+    ///
+    /// So this method drives the issuer's `end_session_endpoint` through the same
+    /// web authenticator `signIn` uses — the only API that reaches that shared
+    /// cookie jar. A plain `URLSession` request cannot: it has its own cookie
+    /// store, would return 200, and would clear nothing.
+    ///
+    /// **`presentationAnchor` is required to do it.** Passing nil skips the
+    /// browser step and returns `.clearedButBrowserSessionLive`, so the skip is
+    /// reported rather than silent — an extension (which must never present a
+    /// browser) and a unit test both take that path deliberately.
+    ///
+    /// The person sees a system sheet during sign-out. That is unavoidable: the
+    /// consent alert is what buys access to the shared jar, and the shared jar is
+    /// the thing being cleared. Cancelling it is not a failed sign-out — local
+    /// tokens are already gone — so cancellation is reported as
+    /// `.clearedButBrowserSessionLive`, never as a throw.
+    public func signOut(presentationAnchor: ASPresentationAnchor? = nil) async -> SignOutResult {
         GrooAuthLog.signin.notice("signOut: start")
         let loaded: StoredTokens?
         var revokeFailureReason: String?
@@ -903,6 +937,11 @@ public actor GrooAuthSession {
         }
         GrooAuthLog.signin.notice("signOut: revoke result=\(revokeFailureReason == nil ? "ok" : "failed", privacy: .public)")
 
+        let browserFailureReason = await endBrowserSession(presentationAnchor: presentationAnchor)
+        GrooAuthLog.signin.notice(
+            "signOut: browser session result=\(browserFailureReason == nil ? "ended" : "still live", privacy: .public)"
+        )
+
         do {
             try tokenStore.clear()
         } catch {
@@ -911,18 +950,80 @@ public actor GrooAuthSession {
             // surface both failures in the reason rather than losing one.
             publish(.signedOut)
             let clearFailure = "failed to clear local tokens: \(error)"
-            let reason = revokeFailureReason.map { "\($0); \(clearFailure)" } ?? clearFailure
+            // Every failure that occurred, in one reason. Losing one because
+            // another is being reported is how a partial sign-out reads as clean.
+            let reason = [revokeFailureReason, browserFailureReason, clearFailure]
+                .compactMap { $0 }
+                .joined(separator: "; ")
             GrooAuthLog.signin.error("signOut: done, outcome=clearedButRevokeFailed reason=\(reason, privacy: .public)")
             return .clearedButRevokeFailed(reason: reason)
         }
 
         publish(.signedOut)
+        // A failed revoke outranks a live browser session when both happen: it is
+        // the case whose reason string carries both, so nothing is dropped.
         if let revokeFailureReason {
-            GrooAuthLog.signin.notice("signOut: done, outcome=clearedButRevokeFailed reason=\(revokeFailureReason, privacy: .public)")
-            return .clearedButRevokeFailed(reason: revokeFailureReason)
+            let reason = [revokeFailureReason, browserFailureReason].compactMap { $0 }.joined(separator: "; ")
+            GrooAuthLog.signin.notice("signOut: done, outcome=clearedButRevokeFailed reason=\(reason, privacy: .public)")
+            return .clearedButRevokeFailed(reason: reason)
+        }
+        if let browserFailureReason {
+            GrooAuthLog.signin.notice(
+                "signOut: done, outcome=clearedButBrowserSessionLive reason=\(browserFailureReason, privacy: .public)"
+            )
+            return .clearedButBrowserSessionLive(reason: browserFailureReason)
         }
         GrooAuthLog.signin.notice("signOut: done, outcome=revokedAndCleared")
         return .revokedAndCleared
+    }
+
+    /// Drives the issuer's `end_session_endpoint` through the web authenticator,
+    /// which is the only path to the cookie jar `ASWebAuthenticationSession`
+    /// shares with the system browser.
+    ///
+    /// Returns nil on success, or a reason the browser session is still live.
+    /// It never throws: by the time this runs the local sign-out is already
+    /// decided, and no browser outcome may prevent it.
+    private func endBrowserSession(presentationAnchor: ASPresentationAnchor?) async -> String? {
+        guard let presentationAnchor else {
+            return "no presentation anchor was supplied, so the issuer's browser session was left untouched"
+        }
+        let doc: DiscoveryDocument
+        do {
+            doc = try await loadDiscovery()
+        } catch {
+            return "failed to load discovery for end-session: \(error)"
+        }
+        guard let endSession = doc.endSessionEndpoint else {
+            return "the issuer advertises no end_session_endpoint"
+        }
+        guard var components = URLComponents(url: endSession, resolvingAgainstBaseURL: false) else {
+            return "end_session_endpoint is not a valid URL: \(endSession)"
+        }
+        // `post_logout_redirect_uri` is what closes the sheet. Without a redirect
+        // back to a registered scheme the endpoint answers 200 with a body, and
+        // ASWebAuthenticationSession has no completion to fire — the person is
+        // left staring at a blank page until they cancel.
+        components.queryItems = (components.queryItems ?? []) + [
+            URLQueryItem(name: "post_logout_redirect_uri", value: config.redirectURI)
+        ]
+        guard let url = components.url else {
+            return "could not build the end-session URL from \(endSession)"
+        }
+        do {
+            _ = try await webAuthenticator.authenticate(
+                url: url,
+                callbackScheme: config.callbackScheme,
+                anchor: presentationAnchor
+            )
+            return nil
+        } catch GrooAuthError.userCancelled {
+            // A closed sheet, not a fault — but the cookie survives it, and the
+            // caller is told so rather than being handed a clean result.
+            return "the sign-out browser sheet was dismissed before the issuer could clear its session"
+        } catch {
+            return "end-session request failed: \(error)"
+        }
     }
 
     // MARK: - Token exchange (shared by refresh + signIn)

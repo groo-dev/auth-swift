@@ -1,5 +1,23 @@
 import XCTest
+import AuthenticationServices
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 @testable import GrooAuth
+
+/// Real `ASPresentationAnchor` for tests — a throwaway window satisfies the type
+/// without an actual presented UI.
+@MainActor
+private func makeTestAnchor() -> ASPresentationAnchor {
+    #if canImport(AppKit)
+    return NSWindow()
+    #elseif canImport(UIKit)
+    return UIWindow()
+    #endif
+}
 
 /// `TokenStoring` test double whose `load()` always throws — simulates a
 /// genuine Keychain read failure (as opposed to a legitimate "no tokens
@@ -40,6 +58,12 @@ final class SignOutTests: XCTestCase {
     {"issuer":"https://accounts.groo.dev","authorization_endpoint":"https://accounts.groo.dev/v1/oauth/authorize","token_endpoint":"https://accounts.groo.dev/v1/oauth/token","jwks_uri":"https://accounts.groo.dev/.well-known/jwks.json","revocation_endpoint":"https://accounts.groo.dev/v1/oauth/revoke"}
     """#
 
+    /// Same document plus the RP-Initiated Logout endpoint, for the tests that
+    /// exercise a full sign-out rather than only the token half.
+    private let discoveryBodyWithEndSession = #"""
+    {"issuer":"https://accounts.groo.dev","authorization_endpoint":"https://accounts.groo.dev/v1/oauth/authorize","token_endpoint":"https://accounts.groo.dev/v1/oauth/token","jwks_uri":"https://accounts.groo.dev/.well-known/jwks.json","revocation_endpoint":"https://accounts.groo.dev/v1/oauth/revoke","end_session_endpoint":"https://accounts.groo.dev/v1/auth/logout"}
+    """#
+
     private func tokens(user: GrooUser = GrooUser(sub: "u", email: nil, name: nil)) -> StoredTokens {
         StoredTokens(
             accessToken: "access-1", refreshToken: "refresh-123", tokenType: "Bearer",
@@ -52,15 +76,19 @@ final class SignOutTests: XCTestCase {
         try store.save(tokens())
 
         let transport = MockTransport(routes: [
-            discoveryURL: (200, discoveryBodyWithRevocation),
+            discoveryURL: (200, discoveryBodyWithEndSession),
             revokeURL: (200, ""),
         ])
+        // `.revokedAndCleared` now means the BROWSER session ended too, so this
+        // test has to supply an anchor and a web authenticator that succeeds.
+        // Without both it would (correctly) report the session still live.
+        let web = StubWebAuthenticator(result: .success(URL(string: "groo://callback")!))
         let session = GrooAuthSession(
             config: testConfig, tokenStore: store, transport: transport,
-            webAuthenticator: StubWebAuthenticator(), now: { Date() }
+            webAuthenticator: web, now: { Date() }
         )
 
-        let result = await session.signOut()
+        let result = await session.signOut(presentationAnchor: await makeTestAnchor())
 
         XCTAssertEqual(result, .revokedAndCleared)
         XCTAssertNil(try store.load(), "signOut must clear local tokens")
@@ -139,7 +167,16 @@ final class SignOutTests: XCTestCase {
 
         let result = await session.signOut()
 
-        XCTAssertEqual(result, .revokedAndCleared)
+        // No anchor, so the issuer's browser session is deliberately left alone —
+        // and that is REPORTED rather than rounded up to a clean sign-out. This
+        // assertion changed on 2026-08-31 with RP-initiated logout: it previously
+        // read `.revokedAndCleared`, which would now claim a browser session had
+        // been ended when nothing had touched it.
+        guard case .clearedButBrowserSessionLive(let reason) = result else {
+            XCTFail("expected .clearedButBrowserSessionLive with no anchor, got \(result)")
+            return
+        }
+        XCTAssertTrue(reason.contains("anchor"), "reason should name the missing anchor: \(reason)")
         XCTAssertEqual(transport.totalCallCount, 0, "no tokens means nothing to revoke; no network calls at all")
 
         let state = await session.currentState()

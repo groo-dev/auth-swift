@@ -417,7 +417,11 @@ public struct GrooAccountView: View {
         Task {
             // The result says whether the issuer was reached; this device is
             // signed out either way, so the screen closes either way.
-            await controller.signOut()
+            //
+            // THE ANCHOR IS WHAT ENDS THE BROWSER SESSION. Without it the issuer's
+            // cookie survives sign-out and the next sign-in silently returns the
+            // same person -- on a shared device, to whoever holds it next.
+            await controller.signOut(presentationAnchor: GrooSignInView.presentationAnchor())
             isSigningOut = false
             dismiss()
         }

@@ -6,6 +6,11 @@ public struct DiscoveryDocument: Sendable {
     public let jwksURI: URL
     public let revocationEndpoint: URL?
     public let userinfoEndpoint: URL?
+    /// OIDC RP-Initiated Logout. Optional because an issuer may not offer one —
+    /// and `signOut` reports that it could not end the browser session rather
+    /// than guessing a path, since a wrong guess would open a browser sheet on
+    /// a 404 and leave the person cancelling it.
+    public let endSessionEndpoint: URL?
 }
 
 struct JWK: Decodable, Sendable { let kty: String; let crv: String?; let x: String?; let y: String?; let kid: String?; let alg: String? }
@@ -18,10 +23,12 @@ func fetchDiscovery(issuer: URL, transport: HTTPTransporting) async throws -> Di
     struct Wire: Decodable {
         let authorization_endpoint: URL; let token_endpoint: URL; let jwks_uri: URL
         let revocation_endpoint: URL?; let userinfo_endpoint: URL?
+        let end_session_endpoint: URL?
     }
     let w: Wire
     do { w = try JSONDecoder().decode(Wire.self, from: data) }
     catch { throw GrooAuthError.invalidResponse("discovery doc missing/invalid field: \(error)") }
     return DiscoveryDocument(authorizationEndpoint: w.authorization_endpoint, tokenEndpoint: w.token_endpoint,
-                             jwksURI: w.jwks_uri, revocationEndpoint: w.revocation_endpoint, userinfoEndpoint: w.userinfo_endpoint)
+                             jwksURI: w.jwks_uri, revocationEndpoint: w.revocation_endpoint, userinfoEndpoint: w.userinfo_endpoint,
+                             endSessionEndpoint: w.end_session_endpoint)
 }

@@ -97,9 +97,15 @@ public final class GrooAuthController {
 
     /// Local tokens are cleared either way; the result says whether the issuer was
     /// also reached. A network failure must still leave this device signed out.
+    ///
+    /// **Pass the anchor.** Without it the issuer's browser session survives, and
+    /// the next `signIn` can complete with no prompt as the same person — the
+    /// result then says `.clearedButBrowserSessionLive` rather than pretending
+    /// otherwise. The anchor is optional only so an extension, which must never
+    /// present a browser, can still sign out.
     @discardableResult
-    public func signOut() async -> SignOutResult {
-        await session.signOut()
+    public func signOut(presentationAnchor: ASPresentationAnchor? = nil) async -> SignOutResult {
+        await session.signOut(presentationAnchor: presentationAnchor)
     }
 
     /// Awaits the first published state. For tests, which must not race the
