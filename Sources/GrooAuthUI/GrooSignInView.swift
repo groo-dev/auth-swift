@@ -153,7 +153,12 @@ public struct GrooSignInView: View {
         errorMessage = nil
         Task {
             do {
-                try await controller.signIn(presentationAnchor: Self.presentationAnchor())
+                // `prompt: .login` because THIS SCREEN ONLY EXISTS WHEN SIGNED OUT.
+                // Without it the issuer answers the cookie the system browser still
+                // holds and returns a code with no screen at all -- so signing out
+                // and signing back in silently returned the same account, with no
+                // way to be anybody else. Reported 2026-08-31.
+                try await controller.signIn(presentationAnchor: Self.presentationAnchor(), prompt: .login)
             } catch GrooAuthError.userCancelled {
                 // A closed sheet is not a failure. Reporting it teaches people to
                 // ignore this label, which is where a real error then goes unread.

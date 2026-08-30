@@ -79,19 +79,21 @@ final class SignOutTests: XCTestCase {
             discoveryURL: (200, discoveryBodyWithEndSession),
             revokeURL: (200, ""),
         ])
-        // `.revokedAndCleared` now means the BROWSER session ended too, so this
-        // test has to supply an anchor and a web authenticator that succeeds.
-        // Without both it would (correctly) report the session still live.
-        let web = StubWebAuthenticator(result: .success(URL(string: "groo://callback")!))
+        let web = StubWebAuthenticator()
         let session = GrooAuthSession(
             config: testConfig, tokenStore: store, transport: transport,
             webAuthenticator: web, now: { Date() }
         )
 
-        let result = await session.signOut(presentationAnchor: await makeTestAnchor())
+        let result = await session.signOut()
 
         XCTAssertEqual(result, .revokedAndCleared)
         XCTAssertNil(try store.load(), "signOut must clear local tokens")
+        // signOut must NEVER open a browser: doing so is what would put a system
+        // consent sheet on every sign-out, which is the thing this design rejects.
+        // The discovery document here DOES advertise an end-session endpoint, so
+        // this assertion fails if signOut ever starts using it.
+        XCTAssertNil(web.lastURL, "signOut must not drive the web authenticator")
 
         let state = await session.currentState()
         XCTAssertEqual(state, .signedOut)
@@ -167,16 +169,7 @@ final class SignOutTests: XCTestCase {
 
         let result = await session.signOut()
 
-        // No anchor, so the issuer's browser session is deliberately left alone —
-        // and that is REPORTED rather than rounded up to a clean sign-out. This
-        // assertion changed on 2026-08-31 with RP-initiated logout: it previously
-        // read `.revokedAndCleared`, which would now claim a browser session had
-        // been ended when nothing had touched it.
-        guard case .clearedButBrowserSessionLive(let reason) = result else {
-            XCTFail("expected .clearedButBrowserSessionLive with no anchor, got \(result)")
-            return
-        }
-        XCTAssertTrue(reason.contains("anchor"), "reason should name the missing anchor: \(reason)")
+        XCTAssertEqual(result, .revokedAndCleared)
         XCTAssertEqual(transport.totalCallCount, 0, "no tokens means nothing to revoke; no network calls at all")
 
         let state = await session.currentState()

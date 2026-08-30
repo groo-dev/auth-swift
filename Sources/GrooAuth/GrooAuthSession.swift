@@ -261,7 +261,10 @@ public actor GrooAuthSession {
     /// presentation, a `state` mismatch, an `error=` callback, a failed token
     /// exchange, or a failed `id_token` verification all leave the token store
     /// untouched.
-    public func signIn(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
+    public func signIn(
+        presentationAnchor: ASPresentationAnchor,
+        prompt: GrooAuthPrompt? = nil
+    ) async throws -> GrooUser {
         // `step` always names the last step *entered* (updated before each
         // stage), so the catch block below can log exactly where signIn
         // failed even though the throw sites are scattered — this makes the
@@ -308,6 +311,19 @@ public actor GrooAuthSession {
                 URLQueryItem(name: "code_challenge", value: challenge),
                 URLQueryItem(name: "code_challenge_method", value: "S256"),
             ]
+            // OIDC `prompt`. Omitted by default so a workspace's apps keep single
+            // sign-on: with a live browser session and existing consent the issuer
+            // returns a code with no screen, which is the behaviour every other
+            // Groo app relies on.
+            //
+            // `.login` is what a sign-in SCREEN sends. That screen is only reachable
+            // when this device holds no tokens, which is exactly the moment silently
+            // reusing whoever the browser still remembers is wrong — it is how
+            // "Sign Out" then "Sign In" returned the same account with no prompt,
+            // and on a shared device returned it to the next person.
+            if let prompt {
+                components.queryItems?.append(URLQueryItem(name: "prompt", value: prompt.rawValue))
+            }
             guard let authorizeURL = components.url else {
                 throw GrooAuthError.invalidResponse("failed to construct authorization URL")
             }
@@ -897,12 +913,20 @@ public actor GrooAuthSession {
     /// reported rather than silent — an extension (which must never present a
     /// browser) and a unit test both take that path deliberately.
     ///
-    /// The person sees a system sheet during sign-out. That is unavoidable: the
-    /// consent alert is what buys access to the shared jar, and the shared jar is
-    /// the thing being cleared. Cancelling it is not a failed sign-out — local
-    /// tokens are already gone — so cancellation is reported as
-    /// `.clearedButBrowserSessionLive`, never as a throw.
-    public func signOut(presentationAnchor: ASPresentationAnchor? = nil) async -> SignOutResult {
+    /// ═══ THIS DOES NOT TOUCH THE BROWSER, AND THAT IS DELIBERATE ═══
+    ///
+    /// Ending the issuer's browser session needs `ASWebAuthenticationSession`,
+    /// which shows a system consent sheet ("… Wants to Use … to Sign In") every
+    /// time it opens. On a sign-out that sheet is both confusing and dismissable,
+    /// and it is not how the ecosystem behaves: `accounts.google.com`'s discovery
+    /// document advertises NO `end_session_endpoint` at all (checked 2026-08-31),
+    /// so an app signing in with Google never logs you out of the browser either.
+    ///
+    /// Account switching belongs at sign-in instead — `signIn(prompt: .login)`,
+    /// which costs no sheet on sign-out and puts the browser where a browser is
+    /// expected. `signOutEverywhere` is here for the rarer case that genuinely
+    /// wants the cookie gone.
+    public func signOut() async -> SignOutResult {
         GrooAuthLog.signin.notice("signOut: start")
         let loaded: StoredTokens?
         var revokeFailureReason: String?
@@ -937,11 +961,6 @@ public actor GrooAuthSession {
         }
         GrooAuthLog.signin.notice("signOut: revoke result=\(revokeFailureReason == nil ? "ok" : "failed", privacy: .public)")
 
-        let browserFailureReason = await endBrowserSession(presentationAnchor: presentationAnchor)
-        GrooAuthLog.signin.notice(
-            "signOut: browser session result=\(browserFailureReason == nil ? "ended" : "still live", privacy: .public)"
-        )
-
         do {
             try tokenStore.clear()
         } catch {
@@ -952,28 +971,49 @@ public actor GrooAuthSession {
             let clearFailure = "failed to clear local tokens: \(error)"
             // Every failure that occurred, in one reason. Losing one because
             // another is being reported is how a partial sign-out reads as clean.
-            let reason = [revokeFailureReason, browserFailureReason, clearFailure]
-                .compactMap { $0 }
-                .joined(separator: "; ")
+            let reason = revokeFailureReason.map { "\($0); \(clearFailure)" } ?? clearFailure
             GrooAuthLog.signin.error("signOut: done, outcome=clearedButRevokeFailed reason=\(reason, privacy: .public)")
             return .clearedButRevokeFailed(reason: reason)
         }
 
         publish(.signedOut)
-        // A failed revoke outranks a live browser session when both happen: it is
-        // the case whose reason string carries both, so nothing is dropped.
         if let revokeFailureReason {
-            let reason = [revokeFailureReason, browserFailureReason].compactMap { $0 }.joined(separator: "; ")
-            GrooAuthLog.signin.notice("signOut: done, outcome=clearedButRevokeFailed reason=\(reason, privacy: .public)")
+            GrooAuthLog.signin.notice("signOut: done, outcome=clearedButRevokeFailed reason=\(revokeFailureReason, privacy: .public)")
+            return .clearedButRevokeFailed(reason: revokeFailureReason)
+        }
+        GrooAuthLog.signin.notice("signOut: done, outcome=revokedAndCleared")
+        return .revokedAndCleared
+    }
+
+    /// `signOut`, plus ending the issuer's session in the SYSTEM BROWSER.
+    ///
+    /// Separate from `signOut` because it costs a system consent sheet the person
+    /// must dismiss, so it is never the default — see `signOut`'s own note for
+    /// why the ecosystem puts account switching at sign-in instead.
+    ///
+    /// Reach for this when the cookie itself is the problem: a shared or handed-on
+    /// device, or an explicit "sign out of Groo in this browser too". Ordinary
+    /// sign-out does not need it, and `signIn(prompt: .login)` covers "let me be
+    /// somebody else" without any of this.
+    ///
+    /// Local sign-out always happens first and is never held hostage to the
+    /// browser step: a dismissed sheet returns `.clearedButBrowserSessionLive`,
+    /// never a throw and never a silent success.
+    @discardableResult
+    public func signOutEverywhere(presentationAnchor: ASPresentationAnchor) async -> SignOutResult {
+        let local = await signOut()
+        let browserFailureReason = await endBrowserSession(presentationAnchor: presentationAnchor)
+        GrooAuthLog.signin.notice(
+            "signOutEverywhere: browser session result=\(browserFailureReason == nil ? "ended" : "still live", privacy: .public)"
+        )
+        // A failed revoke outranks a live browser session, but must not erase it.
+        if case .clearedButRevokeFailed(let revokeReason) = local {
+            let reason = [revokeReason, browserFailureReason].compactMap { $0 }.joined(separator: "; ")
             return .clearedButRevokeFailed(reason: reason)
         }
         if let browserFailureReason {
-            GrooAuthLog.signin.notice(
-                "signOut: done, outcome=clearedButBrowserSessionLive reason=\(browserFailureReason, privacy: .public)"
-            )
             return .clearedButBrowserSessionLive(reason: browserFailureReason)
         }
-        GrooAuthLog.signin.notice("signOut: done, outcome=revokedAndCleared")
         return .revokedAndCleared
     }
 
@@ -984,10 +1024,7 @@ public actor GrooAuthSession {
     /// Returns nil on success, or a reason the browser session is still live.
     /// It never throws: by the time this runs the local sign-out is already
     /// decided, and no browser outcome may prevent it.
-    private func endBrowserSession(presentationAnchor: ASPresentationAnchor?) async -> String? {
-        guard let presentationAnchor else {
-            return "no presentation anchor was supplied, so the issuer's browser session was left untouched"
-        }
+    private func endBrowserSession(presentationAnchor: ASPresentationAnchor) async -> String? {
         let doc: DiscoveryDocument
         do {
             doc = try await loadDiscovery()

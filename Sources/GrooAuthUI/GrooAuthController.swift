@@ -80,8 +80,16 @@ public final class GrooAuthController {
     /// `GrooAuthError.userCancelled` as ordinary — that is a closed sheet, not a
     /// failure to report.
     @discardableResult
-    public func signIn(presentationAnchor: ASPresentationAnchor) async throws -> GrooUser {
-        try await session.signIn(presentationAnchor: presentationAnchor)
+    /// `prompt: .login` forces the issuer to re-authenticate instead of answering
+    /// the browser cookie it still holds. A sign-in SCREEN should pass it: that
+    /// screen only appears when this device is signed out, and reusing whoever the
+    /// browser last saw is what made "Sign Out" then "Sign In" return the same
+    /// account with no prompt at all.
+    public func signIn(
+        presentationAnchor: ASPresentationAnchor,
+        prompt: GrooAuthPrompt? = nil
+    ) async throws -> GrooUser {
+        try await session.signIn(presentationAnchor: presentationAnchor, prompt: prompt)
     }
 
     /// Presents the platform passkey sheet — no browser at any point.
@@ -98,14 +106,19 @@ public final class GrooAuthController {
     /// Local tokens are cleared either way; the result says whether the issuer was
     /// also reached. A network failure must still leave this device signed out.
     ///
-    /// **Pass the anchor.** Without it the issuer's browser session survives, and
-    /// the next `signIn` can complete with no prompt as the same person — the
-    /// result then says `.clearedButBrowserSessionLive` rather than pretending
-    /// otherwise. The anchor is optional only so an extension, which must never
-    /// present a browser, can still sign out.
+    /// This leaves the issuer's BROWSER session alone — no sheet, nothing to
+    /// dismiss. Account switching is handled by `signIn(prompt: .login)` instead;
+    /// see `GrooAuthSession.signOut` for why that is the right place for it.
     @discardableResult
-    public func signOut(presentationAnchor: ASPresentationAnchor? = nil) async -> SignOutResult {
-        await session.signOut(presentationAnchor: presentationAnchor)
+    public func signOut() async -> SignOutResult {
+        await session.signOut()
+    }
+
+    /// `signOut`, plus ending the session in the system browser — at the cost of a
+    /// system consent sheet. Not the ordinary path; see `GrooAuthSession`.
+    @discardableResult
+    public func signOutEverywhere(presentationAnchor: ASPresentationAnchor) async -> SignOutResult {
+        await session.signOutEverywhere(presentationAnchor: presentationAnchor)
     }
 
     /// Awaits the first published state. For tests, which must not race the

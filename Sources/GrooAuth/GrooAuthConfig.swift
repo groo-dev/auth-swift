@@ -47,3 +47,19 @@ public enum SignOutResult: Sendable, Equatable {
     /// wants to warn about it needs to be able to tell them apart.
     case clearedButBrowserSessionLive(reason: String)
 }
+
+/// OIDC Core 3.1.2.1 `prompt`, for the values this SDK sends.
+///
+/// Only `login` is offered because it is the only value the Groo issuer
+/// implements — it refuses the others rather than ignoring them, so a case here
+/// that the server would reject would be a case that always fails.
+///
+/// `select_account` is the value that would give a "Continue as X / use a
+/// different account" picker, the way Google's chooser works. It needs a screen
+/// the issuer does not have yet.
+public enum GrooAuthPrompt: String, Sendable, Equatable {
+    /// Re-authenticate, whatever the browser still remembers. Send this from a
+    /// sign-in screen: reaching that screen means this device is signed out, and
+    /// silently reusing a stale browser identity there is the bug this exists for.
+    case login
+}

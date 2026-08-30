@@ -17,7 +17,7 @@ private func makeAnchor() -> ASPresentationAnchor {
     #endif
 }
 
-/// RP-INITIATED LOGOUT: `signOut` MUST END THE ISSUER'S BROWSER SESSION.
+/// RP-INITIATED LOGOUT: `signOutEverywhere` ENDS THE ISSUER'S BROWSER SESSION.
 ///
 /// ═══ THE DEFECT THESE TESTS EXIST FOR ═══
 ///
@@ -37,10 +37,26 @@ private func makeAnchor() -> ASPresentationAnchor {
 /// On a shared device this means "Sign Out" leaves the next person one tap from
 /// the previous person's account, with no credential.
 ///
+/// ═══ THIS IS `signOutEverywhere`, AND NOT THE ORDINARY SIGN-OUT ═══
+///
+/// The first fix put this on every sign-out, and that was wrong. Reaching the
+/// shared cookie jar means `ASWebAuthenticationSession`, which shows a system
+/// consent sheet ("… Wants to Use … to Sign In") every time it opens — on a
+/// sign-out that is confusing, dismissable, and not how the ecosystem behaves:
+/// `accounts.google.com` advertises no `end_session_endpoint` AT ALL (checked
+/// 2026-08-31 against its live discovery document), so an app signing in with
+/// Google never logs you out of the browser either.
+///
+/// Ordinary account switching moved to sign-in instead, as `prompt=login`
+/// (`GrooAuthPrompt` here, `authorize-prompt.spec.ts` on the server). It costs no
+/// sheet, and the browser appears only where a browser is expected. What stays
+/// here is the rarer, explicit "end the browser session too" — under its own name
+/// so that nothing gets it by accident.
+///
 /// ═══ WHY THESE ASSERTIONS ARE SHAPED THIS WAY ═══
 ///
-/// A test that only checked `signOut` returns `.revokedAndCleared` would have
-/// passed throughout the entire bug — that was the return value the whole time.
+/// A test that only checked the return value would have passed throughout the
+/// entire bug — `.revokedAndCleared` was what came back the whole time.
 /// So each test below asserts on the thing that was actually missing: that a
 /// request reached the web authenticator, that it went to the ADVERTISED
 /// end-session URL, and that it carried a `post_logout_redirect_uri` (without
@@ -97,10 +113,10 @@ final class EndSessionSignOutTests: XCTestCase {
         let web = StubWebAuthenticator(result: .success(URL(string: "groo://callback")!))
         let s = session(discovery: withEndSession, web: web, store: store)
 
-        let result = await s.signOut(presentationAnchor: await makeAnchor())
+        let result = await s.signOutEverywhere(presentationAnchor: await makeAnchor())
 
         XCTAssertEqual(result, .revokedAndCleared)
-        let url = try XCTUnwrap(web.lastURL, "signOut must drive the web authenticator — this is the whole fix")
+        let url = try XCTUnwrap(web.lastURL, "signOutEverywhere must drive the web authenticator — this is the whole point of it")
         XCTAssertEqual(url.host, "accounts.groo.dev")
         XCTAssertEqual(url.path, "/v1/auth/logout", "must use the ADVERTISED endpoint, not a guessed path")
     }
@@ -113,7 +129,7 @@ final class EndSessionSignOutTests: XCTestCase {
         let web = StubWebAuthenticator(result: .success(URL(string: "groo://callback")!))
         let s = session(discovery: withEndSession, web: web, store: store)
 
-        _ = await s.signOut(presentationAnchor: await makeAnchor())
+        _ = await s.signOutEverywhere(presentationAnchor: await makeAnchor())
 
         let url = try XCTUnwrap(web.lastURL)
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
@@ -132,7 +148,7 @@ final class EndSessionSignOutTests: XCTestCase {
         let web = StubWebAuthenticator(result: .failure(GrooAuthError.userCancelled))
         let s = session(discovery: withEndSession, web: web, store: store)
 
-        let result = await s.signOut(presentationAnchor: await makeAnchor())
+        let result = await s.signOutEverywhere(presentationAnchor: await makeAnchor())
 
         guard case .clearedButBrowserSessionLive(let reason) = result else {
             XCTFail("a dismissed sheet leaves the cookie alive and must say so — got \(result)")
@@ -152,7 +168,7 @@ final class EndSessionSignOutTests: XCTestCase {
         let web = StubWebAuthenticator(result: .success(URL(string: "groo://callback")!))
         let s = session(discovery: withoutEndSession, web: web, store: store)
 
-        let result = await s.signOut(presentationAnchor: await makeAnchor())
+        let result = await s.signOutEverywhere(presentationAnchor: await makeAnchor())
 
         guard case .clearedButBrowserSessionLive(let reason) = result else {
             XCTFail("expected the live browser session to be reported, got \(result)")
@@ -179,7 +195,7 @@ final class EndSessionSignOutTests: XCTestCase {
             now: { Date() }
         )
 
-        let result = await s.signOut(presentationAnchor: await makeAnchor())
+        let result = await s.signOutEverywhere(presentationAnchor: await makeAnchor())
 
         guard case .clearedButRevokeFailed(let reason) = result else {
             XCTFail("a failed revoke is the more serious case and should be reported — got \(result)")
