@@ -114,8 +114,8 @@ public final class KeychainTokenStore: TokenStoring {
     private func upsert(account: String, data: Data) throws {
         let deleteStatus = SecItemDelete(baseQuery(account: account) as CFDictionary)
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            GrooAuthLog.token.error("keychain save: delete status=\(deleteStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public) (aborting before add)")
-            throw GrooAuthError.transport("keychain save-delete \(deleteStatus)")
+            GrooAuthLog.token.error("keychain upsert account=\(account, privacy: .public): delete status=\(deleteStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public) (aborting before add)")
+            throw GrooAuthError.transport("keychain upsert-delete \(account) \(deleteStatus)")
         }
 
         var addQuery = baseQuery(account: account)
@@ -127,7 +127,7 @@ public final class KeychainTokenStore: TokenStoring {
         // a non-zero addStatus here (e.g. -34018 errSecMissingEntitlement)
         // means the item never actually landed in the keychain even though
         // signIn() looked like it completed.
-        GrooAuthLog.token.notice("keychain save: delete status=\(deleteStatus, privacy: .public) add status=\(addStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
+        GrooAuthLog.token.notice("keychain upsert account=\(account, privacy: .public): delete status=\(deleteStatus, privacy: .public) add status=\(addStatus, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
         guard addStatus == errSecSuccess else {
             throw GrooAuthError.transport("keychain save \(addStatus)")
         }
@@ -136,9 +136,10 @@ public final class KeychainTokenStore: TokenStoring {
     public func clearTokens(keeping user: GrooUser) throws {
         // Identity FIRST: an interruption between the two steps then leaves tokens
         // and identity (still signed in) rather than neither (forgotten).
+        // Order matters: identity before tokens delete — see doc comment.
         try upsert(account: Self.identityAccount, data: JSONEncoder().encode(user))
         let status = SecItemDelete(baseQuery() as CFDictionary)
-        GrooAuthLog.token.notice("keychain clearTokens(keeping:) delete status=\(status, privacy: .public) service=\(self.service, privacy: .public)")
+        GrooAuthLog.token.notice("keychain clearTokens(keeping:) delete status=\(status, privacy: .public) service=\(self.service, privacy: .public) group=\(self.accessGroup ?? "nil", privacy: .public)")
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw GrooAuthError.transport("keychain clear-tokens \(status)")
         }

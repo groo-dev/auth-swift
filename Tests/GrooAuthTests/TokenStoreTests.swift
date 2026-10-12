@@ -152,6 +152,7 @@ final class TokenStoreTests: XCTestCase {
 
     func testKeychainStoreKeepsIdentity() throws {
         let store = KeychainTokenStore(service: "dev.groo.test.\(UUID().uuidString)", accessGroup: nil)
+        addTeardownBlock { try? store.clear() }
         do {
             try store.save(sampleTokens())
             try store.clear()
@@ -161,17 +162,18 @@ final class TokenStoreTests: XCTestCase {
         try assertIdentitySemantics(store)
     }
 
-    func testKeychainClearTokensWritesIdentityBeforeDeletingTokens() throws {
-        // Write order is the crash-safety property: identity first, so an interruption
-        // leaves tokens + identity (still signed in), never neither.
+    func testKeychainClearTokensLeavesIdentityAndNoTokens() throws {
+        // This checks the end state only. The identity-first write ORDER (crash safety:
+        // an interruption leaves tokens + identity, never neither) is enforced by the
+        // implementation and its comment, not by this test.
         let store = KeychainTokenStore(service: "dev.groo.test.\(UUID().uuidString)", accessGroup: nil)
+        addTeardownBlock { try? store.clear() }
         do { try store.save(sampleTokens()) } catch GrooAuthError.transport(let m) where m.contains("-34018") {
             throw XCTSkip("Keychain unavailable: \(m)")
         }
         try store.clearTokens(keeping: alice)
         XCTAssertEqual(try store.loadIdentity(), alice)
         XCTAssertNil(try store.load())
-        try store.clear()
     }
 
     /// A store written before reauth existed — like gr/ios's NonDestructiveTokenStore,
