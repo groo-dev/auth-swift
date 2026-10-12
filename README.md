@@ -238,6 +238,7 @@ Task {
         switch state {
         case .signedOut:            break   // update UI to the logged-out state
         case .signedIn(let user):   break   // update UI with the user
+        case .reauthRequired(let user): break   // session ended, but we know who it was
         }
     }
 }
@@ -265,7 +266,7 @@ case .clearedButRevokeFailed(let reason):
 | `GrooAuthSession` (`actor`) | The entry point — `signIn`, `signInWithPasskey`, `signOut`, `accessToken`, `forceRefreshAccessToken`, `accountRequest`, `currentState`, `stateStream`. |
 | `GrooAuthConfig` | Issuer, client ID, redirect URI, scopes, keychain service/access group. |
 | `GrooUser` | `sub`, `email`, `name` from the verified ID token. |
-| `GrooAuthState` | `.signedOut` / `.signedIn(GrooUser)`. |
+| `GrooAuthState` | `.signedOut` / `.signedIn(GrooUser)` / `.reauthRequired(GrooUser)`. |
 | `SignOutResult` | `.revokedAndCleared` / `.clearedButRevokeFailed(reason:)`. |
 | `GrooAuthError` | Typed errors, all `LocalizedError`. |
 | `TokenStoring` | Protocol for token persistence. |
@@ -281,6 +282,65 @@ case .clearedButRevokeFailed(let reason):
 | `GrooAccountListsStore` | `@Observable` passkeys / devices / connected apps / tokens. |
 | `GrooAvatar` | The initials circle, on its own. |
 
+## Session states and errors
+
+`GrooAuthState` has three cases, and an app should do something different in each:
+
+| State | Meaning | What the app does |
+|---|---|---|
+| `.signedOut` | No tokens and no kept identity (never signed in, or explicitly signed out). | Show sign-in. Forget any per-user data. |
+| `.signedIn(user)` | Tokens are held; `accessToken()` works. | Show the app. |
+| `.reauthRequired(user)` | The issuer refused the refresh token (expired, revoked, or the client may no longer refresh). The tokens are gone; **who the person was is kept**. | Keep the person's local data, show a sign-in prompt, and name `user`. |
+
+`GrooAuthController` mirrors this: in reauth `user` stays set, `isSignedIn` is
+`false` and `requiresReauth` is `true`. An app that only looks at `isSignedIn`
+shows its sign-in screen, exactly as before.
+
+### `.reauthRequired`
+
+- Entering it clears the tokens and keeps the identity (a `TokenStoring` that
+  supports identity stores it separately from the tokens).
+- `accessToken()` and `forceRefreshAccessToken()` throw `GrooAuthError.reauthRequired`
+  whenever an identity is kept and no tokens exist, including on the refresh that
+  was refused. `registerPasskey` with no tokens does the same. The issuer's OAuth
+  error code goes to the log. With no identity kept they throw `.signedOut`.
+- `signOut()` is explicit and **forgets the identity**: the state becomes `.signedOut`.
+- A new successful sign-in **replaces** the kept identity. The SDK accepts any
+  account; **checking that it is the same account (`sub`) is the app's job**.
+- A refresh whose session changed while it was in flight (an explicit sign-out, or
+  a different sign-in) discards its result: no store write and no state published,
+  so a late refresh answer can't undo a sign-out or clobber a new user.
+  `signOut()` also waits for any in-flight refresh before revoking, so it revokes
+  the live (possibly rotated) refresh token.
+- After clearing on a refused refresh the session publishes the state the store
+  reports. A store without identity support therefore reports `.signedOut`.
+
+### Token-endpoint error classification
+
+| Token endpoint response | Error | State on refresh |
+|---|---|---|
+| 4xx with an OAuth error body (`invalid_grant`, `invalid_client`, ...) | `.protocolError` | Refresh refused: `.reauthRequired` (or `.signedOut` if no identity is known) |
+| 5xx, 408, 429 | `.transport` | Unchanged. Retry later. |
+| Anything else (e.g. a 4xx HTML error page, an unparseable body) | `.invalidResponse` | Unchanged |
+
+Only a 4xx OAuth error is the issuer's verdict on the grant. A 408 or 429 is a
+timeout or rate limit, and a 5xx is a server failure; none of them should sign
+anyone out.
+
+### Custom `TokenStoring` implementations
+
+Two requirements carry the kept identity:
+
+| Requirement | Default |
+|---|---|
+| `clearTokens(keeping: GrooUser) throws` | Calls `clear()` |
+| `loadIdentity() throws -> GrooUser?` | Returns `nil` |
+
+`KeychainTokenStore` and `InMemoryTokenStore` implement both. A custom store that
+implements neither keeps today's behaviour: a refused refresh clears it and the
+session reports `.signedOut`. The defaults also preserve a store's own clearing
+rules, for example an extension's wrapper whose `clear()` is deliberately a no-op.
+
 ## Error handling
 
 `signIn`, `accessToken`, and `forceRefreshAccessToken` throw `GrooAuthError`. Every case conforms to `LocalizedError`, and messages intentionally surface the underlying detail (server error codes, validation messages) so you can show `error.localizedDescription` directly:
@@ -293,7 +353,8 @@ case .clearedButRevokeFailed(let reason):
 | `.invalidResponse(String)` | A malformed or unexpected response. |
 | `.stateMismatch` | The `state` returned didn't match — request rejected. |
 | `.idTokenInvalid(String)` | The ID token failed signature/claim verification. |
-| `.signedOut` | No valid session (e.g. refresh token expired/revoked). |
+| `.signedOut` | No session at all, and no kept identity. |
+| `.reauthRequired` | The issuer ended the session but the identity is kept. Ask the same person to sign in again. |
 | `.passkeyUnavailable` | No passkey on this device for the issuer. Offer `signIn`. |
 | `.interactionRequired(OAuthProtocolError)` | The issuer needs a screen the app has none of. Fall back to `signIn`. |
 | `.insufficientScope(String)` | The token lacks a scope the request needs, and names it. |
