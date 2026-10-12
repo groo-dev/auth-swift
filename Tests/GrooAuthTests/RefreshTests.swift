@@ -85,6 +85,40 @@ final class RefreshTests: XCTestCase {
 
     // MARK: - Cached / no-op paths
 
+    func testA503DuringRefreshKeepsTheSessionAndIsATransportError() async throws {
+        let store = InMemoryTokenStore()
+        let tokens = expiredTokens()
+        try store.save(tokens)
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (503, #"{"error":"server_error"}"#),
+        ])
+        let session = GrooAuthSession(config: testConfig, tokenStore: store, transport: transport,
+                                      webAuthenticator: StubWebAuthenticator(), now: { Date() })
+        do {
+            _ = try await session.accessToken()
+            XCTFail("expected a transport error")
+        } catch GrooAuthError.transport(let m) {
+            XCTAssertTrue(m.contains("503"))
+        }
+        XCTAssertEqual(try store.load(), tokens, "a server failure must not touch the stored tokens")
+        let state = await session.currentState()
+        XCTAssertEqual(state, .signedIn(tokens.user!))
+    }
+
+    func testA429DuringRefreshKeepsTheSession() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expiredTokens())
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (429, #"{"error":"slow_down"}"#),
+        ])
+        let session = GrooAuthSession(config: testConfig, tokenStore: store, transport: transport,
+                                      webAuthenticator: StubWebAuthenticator(), now: { Date() })
+        do { _ = try await session.accessToken(); XCTFail("expected transport") } catch GrooAuthError.transport {}
+        XCTAssertNotNil(try store.load())
+    }
+
     func testAccessTokenReturnsCachedTokenWhenNotExpired() async throws {
         let store = InMemoryTokenStore()
         let user = GrooUser(sub: "u", email: nil, name: nil)

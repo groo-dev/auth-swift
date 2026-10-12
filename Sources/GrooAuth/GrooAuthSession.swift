@@ -1073,14 +1073,32 @@ public actor GrooAuthSession {
         let (data, response) = try await postForm(url: doc.tokenEndpoint, parameters: parameters)
         GrooAuthLog.signin.notice("signIn/refresh: token exchange HTTP done status=\(response.statusCode, privacy: .public)")
         guard response.statusCode == 200 else {
-            let protocolError = try OAuthProtocolError.decode(data)
-            throw GrooAuthError.protocolError(protocolError)
+            throw Self.tokenEndpointError(status: response.statusCode, body: data)
         }
         do {
             return try JSONDecoder().decode(TokenResponse.self, from: data)
         } catch {
             throw GrooAuthError.invalidResponse("token response missing/invalid field: \(error)")
         }
+    }
+
+    /// What a non-200 token-endpoint response means.
+    ///
+    /// Only a 4xx carrying an OAuth error body is the issuer's verdict on the
+    /// grant (`protocolError`) — and a refresh that earns one is unrecoverable.
+    /// A 5xx, 408 or 429 says nothing about the grant: the server failed, timed
+    /// out or is shedding load, and the same request may succeed later
+    /// (`transport`). Treating those as verdicts is how a server outage used to
+    /// sign everyone out. Anything else is a response we cannot interpret.
+    static func tokenEndpointError(status: Int, body: Data) -> GrooAuthError {
+        if status >= 500 || status == 408 || status == 429 {
+            return .transport("token endpoint HTTP \(status)")
+        }
+        if (400...499).contains(status), let oauth = try? OAuthProtocolError.decode(body) {
+            return .protocolError(oauth)
+        }
+        let snippet = String(decoding: body.prefix(200), as: UTF8.self)
+        return .invalidResponse("token endpoint HTTP \(status): \(snippet)")
     }
 
     /// POSTs a form-encoded body to `url` via the shared transport and returns the
