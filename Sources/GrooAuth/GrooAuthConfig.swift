@@ -27,6 +27,11 @@ public struct GrooUser: Sendable, Equatable, Codable {
 public enum GrooAuthState: Sendable, Equatable {
     case signedOut
     case signedIn(GrooUser)
+    /// The issuer refused this person's refresh token (expired, revoked, or the
+    /// client is no longer allowed to refresh). Their tokens are gone; who they
+    /// are is not — the app should keep their local data and ask them to sign in
+    /// again. Explicit sign-out leaves this state for `.signedOut`.
+    case reauthRequired(GrooUser)
 }
 
 public enum SignOutResult: Sendable, Equatable {

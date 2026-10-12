@@ -93,6 +93,8 @@ public final class GrooAccountStore {
             return "This app was not granted permission to \(scope). Sign out and in again to approve it."
         case .signedOut:
             return "You are signed out."
+        case .reauthRequired:
+            return "Your session has ended. Sign in again to continue."
         case .protocolError(let oauth), .interactionRequired(let oauth):
             return oauth.errorDescription ?? oauth.error
         case .transport(let detail), .invalidResponse(let detail), .idTokenInvalid(let detail):

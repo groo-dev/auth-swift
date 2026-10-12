@@ -25,6 +25,10 @@ private struct UnusedTransport: HTTPTransporting {
 }
 
 private func makeSession(storing tokens: StoredTokens?) -> GrooAuthSession {
+    makeSession(store: InMemoryTokenStore(tokens: tokens))
+}
+
+private func makeSession(store: TokenStoring) -> GrooAuthSession {
     GrooAuthSession(
         config: GrooAuthConfig(
             issuer: URL(string: "https://me.example.test")!,
@@ -33,7 +37,7 @@ private func makeSession(storing tokens: StoredTokens?) -> GrooAuthSession {
             scopes: ["openid"],
             keychainService: "test"
         ),
-        tokenStore: InMemoryTokenStore(tokens: tokens),
+        tokenStore: store,
         transport: UnusedTransport(),
         webAuthenticator: UnusedWebAuthenticator()
     )
@@ -78,6 +82,25 @@ final class GrooAuthControllerTests: XCTestCase {
         XCTAssertFalse(controller.isLoading)
         XCTAssertFalse(controller.isSignedIn)
         XCTAssertNil(controller.user)
+    }
+
+    func testAControllerOverAStoreInReauthKeepsTheUserAndFlagsReauth() async throws {
+        let alice = GrooUser(sub: "alice", email: "a@x.test", name: "Alice")
+        let store = InMemoryTokenStore()
+        try store.clearTokens(keeping: alice)
+        let controller = GrooAuthController(session: makeSession(store: store))
+        await controller.waitForFirstState()
+        XCTAssertFalse(controller.isLoading)
+        XCTAssertFalse(controller.isSignedIn)
+        XCTAssertTrue(controller.requiresReauth)
+        XCTAssertEqual(controller.user, alice)
+    }
+
+    func testASignedInControllerDoesNotRequireReauth() async {
+        let controller = GrooAuthController(session: makeSession(storing: signedInTokens(sub: "u1", email: "a@b.test")))
+        await controller.waitForFirstState()
+        XCTAssertTrue(controller.isSignedIn)
+        XCTAssertFalse(controller.requiresReauth)
     }
 
     func testSessionIsReachableAsAnEscapeHatch() {

@@ -170,6 +170,31 @@ final class SignInTests: XCTestCase {
         XCTAssertEqual(state, .signedIn(user))
     }
 
+    func testSigningInAfterReauthForgetsTheKeptIdentity() async throws {
+        let store = InMemoryTokenStore()
+        try store.clearTokens(keeping: GrooUser(sub: "someone", email: nil, name: nil))
+        let exp = Date().addingTimeInterval(600).timeIntervalSince1970
+        let (jwt, jwksBody) = try makeJWTAndJWKS(claims: [
+            "sub": "user-2", "aud": "test-client", "iss": "https://accounts.groo.dev",
+            "exp": exp, "nonce": expectedNonce, "email": "b@b.c", "name": "Bo",
+        ])
+        let transport = MockTransport(routes: [
+            discoveryURL: (200, discoveryBody),
+            tokenURL: (200, #"""
+            {"access_token":"at2","refresh_token":"rt2","token_type":"Bearer","expires_in":900,"id_token":"\#(jwt)","scope":"openid"}
+            """#),
+            jwksURL: (200, jwksBody),
+        ])
+        let callback = URL(string: "dev.groo.test://oauth-callback?code=abc&state=\(expectedState)")!
+        let session = makeSession(transport: transport, webAuthenticator: StubWebAuthenticator(result: .success(callback)), store: store)
+
+        let user = try await session.signIn(presentationAnchor: await makeTestAnchor())
+
+        let state = await session.currentState()
+        XCTAssertEqual(state, .signedIn(user))
+        XCTAssertNil(try store.loadIdentity(), "a fresh sign-in replaces the kept identity")
+    }
+
     // MARK: - (d) Callback carries an error
 
     func testCallbackErrorThrowsProtocolError() async throws {

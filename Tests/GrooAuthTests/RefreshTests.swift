@@ -58,7 +58,7 @@ final class RefreshTests: XCTestCase {
         XCTAssertEqual(transport.callCount(for: tokenURL), 1)
     }
 
-    func testRefreshRejectionSignsOut() async throws {
+    func testRefreshRejectionRequiresReauth() async throws {
         let store = InMemoryTokenStore()
         try store.save(expiredTokens())
 
@@ -74,12 +74,12 @@ final class RefreshTests: XCTestCase {
         do {
             _ = try await session.accessToken()
             XCTFail("expected refresh rejection to throw")
-        } catch GrooAuthError.protocolError(let err) {
-            XCTAssertEqual(err.error, "invalid_grant")
+        } catch GrooAuthError.reauthRequired {
+            // expected
         }
 
         let state = await session.currentState()
-        XCTAssertEqual(state, .signedOut)
+        XCTAssertEqual(state, .reauthRequired(GrooUser(sub: "u", email: nil, name: nil)))
         XCTAssertNil(try store.load(), "rejected refresh must clear the token store")
     }
 

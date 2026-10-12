@@ -115,14 +115,23 @@ public actor GrooAuthSession {
     }
 
     private func computeCurrentState() -> GrooAuthState {
-        guard let tokens = (try? tokenStore.load()) ?? nil, let user = tokens.user else {
-            return .signedOut
+        if let tokens = (try? tokenStore.load()) ?? nil, let user = tokens.user {
+            return .signedIn(user)
         }
-        return .signedIn(user)
+        if let kept = (try? tokenStore.loadIdentity()) ?? nil {
+            return .reauthRequired(kept)
+        }
+        return .signedOut
+    }
+
+    /// The error for "no tokens": reauth when an identity is kept, else signed out.
+    private func noSessionError() -> GrooAuthError {
+        ((try? tokenStore.loadIdentity()) ?? nil) != nil ? .reauthRequired : .signedOut
     }
 
     /// Emits on every state change: `signIn` success and refresh success emit
-    /// `.signedIn`; refresh rejection and sign-out emit `.signedOut`. A new
+    /// `.signedIn`; a refused refresh emits `.reauthRequired` (identity kept) and
+    /// sign-out emits `.signedOut`. A new
     /// subscriber immediately receives the current state, then subsequent changes.
     public var stateStream: AsyncStream<GrooAuthState> {
         let id = UUID()
@@ -159,11 +168,13 @@ public actor GrooAuthSession {
     }
 
     /// Returns a valid access token, refreshing first if the cached one is expired
-    /// (or within 60s of expiry). Throws `.signedOut` if there are no stored tokens.
+    /// (or within 60s of expiry). Throws `.reauthRequired` if there are no
+    /// tokens but the identity is kept, `.signedOut` if there is nothing at all.
     public func accessToken() async throws -> String {
         guard let tokens = try tokenStore.load() else {
-            GrooAuthLog.signin.notice("accessToken: no stored tokens, signedOut")
-            throw GrooAuthError.signedOut
+            let outcome = noSessionError()
+            GrooAuthLog.signin.notice("accessToken: no stored tokens, outcome=\(String(describing: outcome), privacy: .public)")
+            throw outcome
         }
         if tokens.expiresAt.timeIntervalSince(now()) > 60 {
             GrooAuthLog.signin.notice("accessToken: cache hit")
@@ -172,7 +183,7 @@ public actor GrooAuthSession {
         GrooAuthLog.signin.notice("accessToken: cache expired, refreshing")
         try await refresh()
         guard let refreshed = try tokenStore.load() else {
-            throw GrooAuthError.signedOut
+            throw noSessionError()
         }
         return refreshed.accessToken
     }
@@ -182,12 +193,13 @@ public actor GrooAuthSession {
     /// comes back `401` despite `accessToken()` having handed out what looked
     /// like a still-valid token (e.g. the token was revoked server-side).
     /// Single-flight, same as `accessToken()`'s own refresh path. Throws
-    /// `.signedOut` if there's no session left, or if the refresh token
-    /// itself is rejected (which also publishes `.signedOut` on `stateStream`).
+    /// `.reauthRequired` if the refresh token itself is rejected (which also
+    /// publishes `.reauthRequired` on `stateStream`) or tokens are gone but the
+    /// identity is kept, and `.signedOut` if there's no session left at all.
     public func forceRefreshAccessToken() async throws -> String {
         try await refresh()
         guard let refreshed = try tokenStore.load() else {
-            throw GrooAuthError.signedOut
+            throw noSessionError()
         }
         return refreshed.accessToken
     }
@@ -217,8 +229,9 @@ public actor GrooAuthSession {
     private func performRefresh() async throws {
         GrooAuthLog.signin.notice("performRefresh: start")
         guard let tokens = try tokenStore.load() else {
-            GrooAuthLog.signin.notice("performRefresh: no stored tokens, signedOut")
-            throw GrooAuthError.signedOut
+            let outcome = noSessionError()
+            GrooAuthLog.signin.notice("performRefresh: no stored tokens, outcome=\(String(describing: outcome), privacy: .public)")
+            throw outcome
         }
         do {
             let response = try await requestToken(parameters: [
@@ -241,11 +254,26 @@ public actor GrooAuthSession {
             }
             GrooAuthLog.signin.notice("performRefresh: done, outcome=success")
         } catch let error as GrooAuthError {
-            if case .protocolError = error {
-                // Refresh token was rejected outright (e.g. invalid_grant / revoked).
-                // There is no valid session to recover — clear it and sign out.
-                try? tokenStore.clear()
-                publish(.signedOut)
+            if case .protocolError(let oauth) = error {
+                // The issuer refused the refresh token. Nothing can renew it, but
+                // who signed in is still known: keep that, drop the tokens, and ask
+                // for a sign-in rather than forgetting the person and their data.
+                guard let user = tokens.user else {
+                    GrooAuthLog.signin.error("performRefresh: refused (\(oauth.error, privacy: .public)) and no stored user, signing out")
+                    do { try tokenStore.clear() } catch {
+                        GrooAuthLog.token.error("performRefresh: clear failed: \(String(describing: error), privacy: .public)")
+                    }
+                    publish(.signedOut)
+                    throw GrooAuthError.signedOut
+                }
+                do {
+                    try tokenStore.clearTokens(keeping: user)
+                } catch {
+                    GrooAuthLog.token.error("performRefresh: clearTokens(keeping:) failed: \(String(describing: error), privacy: .public)")
+                }
+                GrooAuthLog.signin.notice("performRefresh: refused (\(oauth.error, privacy: .public)), reauth required, identity kept")
+                publish(.reauthRequired(user))
+                throw GrooAuthError.reauthRequired
             }
             GrooAuthLog.signin.error("performRefresh: done, outcome=failed error=\(String(describing: error), privacy: .public)")
             throw error

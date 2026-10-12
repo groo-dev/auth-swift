@@ -178,6 +178,8 @@ public struct GrooSignInView: View {
         switch authError {
         case .signedOut:
             return "You are signed out. Please try again."
+        case .reauthRequired:
+            return "Your session has ended. Please sign in again."
         case .stateMismatch:
             return "That sign-in could not be verified. Please try again."
         case .userCancelled:

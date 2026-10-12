@@ -27,6 +27,13 @@ public final class GrooAuthController {
     /// `isSignedIn == false`.
     public private(set) var isLoading = true
 
+    /// True when the issuer refused this person's session but the SDK still knows
+    /// who they are (`GrooAuthState.reauthRequired`). `user` stays set; `isSignedIn`
+    /// is false. An app that only looks at `isSignedIn` shows its sign-in screen,
+    /// as before; an offline-first app keeps the person's data and asks them to
+    /// sign in again.
+    public private(set) var requiresReauth = false
+
     /// The underlying session, deliberately public.
     ///
     /// The views in this library are opinionated. That is only acceptable if an
@@ -66,10 +73,16 @@ public final class GrooAuthController {
         switch state {
         case .signedOut:
             isSignedIn = false
+            requiresReauth = false
             user = nil
         case .signedIn(let signedIn):
             isSignedIn = true
+            requiresReauth = false
             user = signedIn
+        case .reauthRequired(let kept):
+            isSignedIn = false
+            requiresReauth = true
+            user = kept
         }
     }
 

@@ -19,6 +19,10 @@ public enum GrooAuthError: Error, Sendable {
     case stateMismatch
     case idTokenInvalid(String)
     case signedOut
+
+    /// The session needs the same person to sign in again: the tokens are gone,
+    /// the identity is kept. See `GrooAuthState.reauthRequired`.
+    case reauthRequired
     case userCancelled
 
     /// This device holds no passkey for the issuer, or the platform declined to
@@ -67,6 +71,8 @@ extension GrooAuthError: LocalizedError {
             return "The identity token could not be verified: \(message)"
         case .signedOut:
             return "You are signed out."
+        case .reauthRequired:
+            return "Your session has ended. Sign in again to continue."
         case .userCancelled:
             return "Sign-in was cancelled."
         case .passkeyUnavailable:
