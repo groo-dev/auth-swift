@@ -108,7 +108,8 @@ final class RefreshTests: XCTestCase {
 
     func testA429DuringRefreshKeepsTheSession() async throws {
         let store = InMemoryTokenStore()
-        try store.save(expiredTokens())
+        let tokens = expiredTokens()
+        try store.save(tokens)
         let transport = MockTransport(routes: [
             discoveryURL: (200, discoveryBody),
             tokenURL: (429, #"{"error":"slow_down"}"#),
@@ -117,6 +118,8 @@ final class RefreshTests: XCTestCase {
                                       webAuthenticator: StubWebAuthenticator(), now: { Date() })
         do { _ = try await session.accessToken(); XCTFail("expected transport") } catch GrooAuthError.transport {}
         XCTAssertNotNil(try store.load())
+        let state = await session.currentState()
+        XCTAssertEqual(state, .signedIn(tokens.user!))
     }
 
     func testAccessTokenReturnsCachedTokenWhenNotExpired() async throws {
