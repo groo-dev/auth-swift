@@ -296,22 +296,31 @@ case .clearedButRevokeFailed(let reason):
 `false` and `requiresReauth` is `true`. An app that only looks at `isSignedIn`
 shows its sign-in screen, exactly as before.
 
+> **Warning: `user != nil` no longer means signed in.** `user` is also set while
+> `requiresReauth`. Gate access to the app on `isSignedIn`, never on `user != nil`.
+
 ### `.reauthRequired`
 
 - Entering it clears the tokens and keeps the identity (a `TokenStoring` that
   supports identity stores it separately from the tokens).
 - `accessToken()` and `forceRefreshAccessToken()` throw `GrooAuthError.reauthRequired`
-  whenever an identity is kept and no tokens exist, including on the refresh that
-  was refused. `registerPasskey` with no tokens does the same. The issuer's OAuth
-  error code goes to the log. With no identity kept they throw `.signedOut`.
+  whenever an identity is kept and no tokens exist. On the refresh that was
+  refused, the thrown error matches the state the store ends up reporting:
+  `.reauthRequired` if the identity was kept, `.signedOut` if it was not (a store
+  without identity support, or tokens with no stored user), and the issuer's
+  original `.protocolError` if the store could not clear at all (a no-op `clear()`,
+  so the state is still `.signedIn`). `registerPasskey` with no tokens throws like
+  `accessToken()`. The issuer's OAuth error code goes to the log.
 - `signOut()` is explicit and **forgets the identity**: the state becomes `.signedOut`.
 - A new successful sign-in **replaces** the kept identity. The SDK accepts any
   account; **checking that it is the same account (`sub`) is the app's job**.
 - A refresh whose session changed while it was in flight (an explicit sign-out, or
-  a different sign-in) discards its result: no store write and no state published,
-  so a late refresh answer can't undo a sign-out or clobber a new user.
-  `signOut()` also waits for any in-flight refresh before revoking, so it revokes
-  the live (possibly rotated) refresh token.
+  a different sign-in) discards its result, success or refusal: no store write and
+  no state published, so a late answer can't undo a sign-out or clobber a new user.
+  The caller then re-loads and gets the current token, or the no-session error.
+  `signOut()` waits up to 5 seconds for an in-flight refresh before revoking, so it
+  revokes the live (possibly rotated) refresh token; past that it revokes what it
+  has and the late result is discarded.
 - After clearing on a refused refresh the session publishes the state the store
   reports. A store without identity support therefore reports `.signedOut`.
 
@@ -340,6 +349,18 @@ Two requirements carry the kept identity:
 implements neither keeps today's behaviour: a refused refresh clears it and the
 session reports `.signedOut`. The defaults also preserve a store's own clearing
 rules, for example an extension's wrapper whose `clear()` is deliberately a no-op.
+
+### Changes in 0.4.4
+
+- A refused refresh now yields `.reauthRequired` (identity kept) instead of `.signedOut`.
+- `GrooAuthController.user` is non-nil during reauth; use `isSignedIn` to gate.
+- Token-endpoint 5xx, 408 and 429 are `.transport`, not `.protocolError`.
+- `TokenStoring` gains `clearTokens(keeping:)` and `loadIdentity()`, with defaults.
+- `signOut()` waits up to 5 seconds for an in-flight refresh.
+
+**Rollback:** an app that returns to 0.4.3 or earlier after entering reauth leaves
+the `groo_oauth_identity` Keychain item behind. It survives reinstall, like the
+tokens, and older versions never read or delete it.
 
 ## Error handling
 

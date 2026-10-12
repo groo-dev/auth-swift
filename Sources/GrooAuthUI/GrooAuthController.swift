@@ -3,7 +3,11 @@ import Observation
 import AuthenticationServices
 import GrooAuth
 
-/// The signed-in person, as SwiftUI can observe them.
+/// The auth state, as SwiftUI can observe it.
+///
+/// `user` is set whenever the SDK knows who the person is: while signed in AND
+/// while `requiresReauth` (tokens gone, identity kept). It does NOT mean "signed
+/// in". Gate on `isSignedIn`, never on `user != nil`.
 ///
 /// `GrooAuthSession` is an actor: correct for a token store that several tasks
 /// touch, and unusable directly from a view body. This republishes its state on
@@ -15,6 +19,9 @@ import GrooAuth
 @MainActor
 @Observable
 public final class GrooAuthController {
+    /// The person the SDK knows: signed in, or kept for a re-sign-in
+    /// (`requiresReauth`). Not "the signed-in person" any more: gate access on
+    /// `isSignedIn`, never on `user != nil`.
     public private(set) var user: GrooUser?
     public private(set) var isSignedIn = false
 

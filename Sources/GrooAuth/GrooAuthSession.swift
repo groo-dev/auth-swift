@@ -54,6 +54,12 @@ public actor GrooAuthSession {
     /// Subscribers to `stateStream`, keyed so a dropped subscriber's continuation
     /// can be pruned individually (see `stateStream`'s `onTermination`).
     /// `publish` fans a state change out to all of them.
+    /// How long `signOut` waits for an in-flight refresh. Internal and mutable
+    /// only so tests can shorten it; not API.
+    private var signOutRefreshWait: Duration = .seconds(5)
+
+    func setSignOutRefreshWaitForTesting(_ wait: Duration) { signOutRefreshWait = wait }
+
     private var stateContinuations: [UUID: AsyncStream<GrooAuthState>.Continuation] = [:]
 
     public init(
@@ -288,7 +294,11 @@ public actor GrooAuthSession {
             GrooAuthLog.signin.notice("performRefresh: done, outcome=success")
         } catch let error as GrooAuthError {
             if case .protocolError(let oauth) = error {
-                if sessionChanged(since: tokens) { throw noSessionError() }
+                // The session was replaced while this was in flight (sign-out, or
+                // another sign-in): the verdict is about a token that is gone.
+                // Return like the success path so callers re-load and get
+                // whatever is current, or noSessionError() if nothing is.
+                if sessionChanged(since: tokens) { return }
                 // The issuer refused the refresh token. Nothing can renew it, but
                 // who signed in is still known: keep that, drop the tokens, and ask
                 // for a sign-in rather than forgetting the person and their data.
@@ -297,8 +307,7 @@ public actor GrooAuthSession {
                     do { try tokenStore.clear() } catch {
                         GrooAuthLog.token.error("performRefresh: clear failed: \(String(describing: error), privacy: .public)")
                     }
-                    publish(computeCurrentState())
-                    throw GrooAuthError.signedOut
+                    throw publishAndErrorForRefusal(error)
                 }
                 do {
                     try tokenStore.clearTokens(keeping: user)
@@ -308,11 +317,25 @@ public actor GrooAuthSession {
                 GrooAuthLog.signin.notice("performRefresh: refused (\(oauth.error, privacy: .public)), reauth required, identity kept")
                 // Publish what the store will actually report: a store that cannot
                 // keep the identity (or cannot clear) must not be contradicted.
-                publish(computeCurrentState())
-                throw GrooAuthError.reauthRequired
+                throw publishAndErrorForRefusal(error)
             }
             GrooAuthLog.signin.error("performRefresh: done, outcome=failed error=\(String(describing: error), privacy: .public)")
             throw error
+        }
+    }
+
+    /// Publishes the state the store now reports after a refused refresh and
+    /// returns the error that agrees with it: `.reauthRequired` / `.signedOut`
+    /// match the resulting state; if the store could not clear (a no-op `clear()`,
+    /// e.g. an extension's non-destructive store) the state is still `.signedIn`,
+    /// so the issuer's original `.protocolError` is surfaced as before.
+    private func publishAndErrorForRefusal(_ refusal: GrooAuthError) -> GrooAuthError {
+        let resulting = computeCurrentState()
+        publish(resulting)
+        switch resulting {
+        case .reauthRequired: return .reauthRequired
+        case .signedOut: return .signedOut
+        case .signedIn: return refusal
         }
     }
 
@@ -994,7 +1017,19 @@ public actor GrooAuthSession {
         // Let an in-flight refresh finish first. Otherwise it can rotate the
         // refresh token while this awaits the revoke, and the token revoked here
         // would be the stale one while the rotated one lives on server-side.
-        if let inFlight = refreshTask { _ = try? await inFlight.value }
+        // Bounded: a hung token request must not hang sign-out.
+        if let inFlight = refreshTask {
+            let (outcomes, outcome) = AsyncStream<Bool>.makeStream()
+            let waiter = Task { _ = try? await inFlight.value; outcome.yield(true) }
+            let wait = signOutRefreshWait
+            let timer = Task { try? await Task.sleep(for: wait); outcome.yield(false) }
+            var finished = true
+            for await done in outcomes { finished = done; break }
+            waiter.cancel(); timer.cancel()
+            if !finished {
+                GrooAuthLog.signin.notice("signOut: in-flight refresh still running after \(String(describing: wait), privacy: .public) — revoking the token we have; the late refresh result will be discarded")
+            }
+        }
         let loaded: StoredTokens?
         var revokeFailureReason: String?
         do {

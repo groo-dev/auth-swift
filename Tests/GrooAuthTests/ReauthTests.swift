@@ -206,11 +206,74 @@ final class ReauthTests: XCTestCase {
         var states = await s.stateStream.makeAsyncIterator()
         _ = await states.next()
 
-        do { _ = try await s.accessToken(); XCTFail("expected reauthRequired") } catch GrooAuthError.reauthRequired {}
+        do { _ = try await s.accessToken(); XCTFail("expected signedOut") } catch GrooAuthError.signedOut {}
 
         let published = await states.next()
         let state = await s.currentState()
         XCTAssertEqual(published, .signedOut)
         XCTAssertEqual(state, .signedOut, "published and reported state agree")
+    }
+
+    /// A store whose clear() does nothing (an extension's non-destructive store).
+    private final class NoOpClearStore: TokenStoring, @unchecked Sendable {
+        var tokens: StoredTokens?
+        func load() throws -> StoredTokens? { tokens }
+        func save(_ tokens: StoredTokens) throws { self.tokens = tokens }
+        func clear() throws {}
+    }
+
+    func testStoreThatCannotClearSurfacesTheOriginalRefusalAndStaysSignedIn() async throws {
+        let store = NoOpClearStore()
+        try store.save(expired(user: alice))
+        let (s, _) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
+        do { _ = try await s.accessToken(); XCTFail("expected protocolError") } catch GrooAuthError.protocolError(let e) {
+            XCTAssertEqual(e.error, "invalid_grant")
+        }
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedIn(alice))
+    }
+
+    func testARefusedRefreshForAReplacedSessionHandsOutTheNewToken() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
+        let gate = transport.gate(tokenURL)
+        var states = await s.stateStream.makeAsyncIterator()
+        _ = await states.next()
+
+        let call = Task { try await s.accessToken() }
+        await gate.waitUntilHeld()
+        let bob = GrooUser(sub: "bob", email: nil, name: nil)
+        try store.save(StoredTokens(accessToken: "bobs", refreshToken: "rb", tokenType: "Bearer",
+                                    expiresAt: Date().addingTimeInterval(900), idToken: nil, scope: nil, user: bob))
+        gate.release()
+
+        let token = try await call.value
+        XCTAssertEqual(token, "bobs")
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedIn(bob))
+        _ = await s.signOut() // sentinel
+        let next = await states.next()
+        XCTAssertEqual(next, .signedOut, "no .reauthRequired was published")
+    }
+
+    func testSignOutDoesNotWaitForeverOnAHungRefresh() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 200, tokenBody: #"{"access_token":"new","refresh_token":"r2","token_type":"Bearer","expires_in":900}"#)
+        await s.setSignOutRefreshWaitForTesting(.milliseconds(100))
+        let gate = transport.gate(tokenURL)
+
+        let refresh = Task { try await s.accessToken() }
+        await gate.waitUntilHeld()
+        _ = await s.signOut() // returns after the bound although the refresh is held
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedOut)
+
+        gate.release()
+        do { _ = try await refresh.value; XCTFail("expected an error") } catch GrooAuthError.signedOut {}
+        XCTAssertNil(try store.load(), "the late refresh result is discarded")
+        let after = await s.currentState()
+        XCTAssertEqual(after, .signedOut)
     }
 }
