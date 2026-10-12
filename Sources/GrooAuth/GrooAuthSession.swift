@@ -51,15 +51,14 @@ public actor GrooAuthSession {
     /// Fixed PKCE verifier/state/nonce for tests (`nil` in production — see `PKCEOverride`).
     private let pkceOverride: PKCEOverride?
 
-    /// Subscribers to `stateStream`, keyed so a dropped subscriber's continuation
-    /// can be pruned individually (see `stateStream`'s `onTermination`).
-    /// `publish` fans a state change out to all of them.
-    /// How long `signOut` waits for an in-flight refresh. Internal and mutable
-    /// only so tests can shorten it; not API.
+    /// How long `signOut` waits for an in-flight refresh (test seam, not API).
     private var signOutRefreshWait: Duration = .seconds(5)
 
     func setSignOutRefreshWaitForTesting(_ wait: Duration) { signOutRefreshWait = wait }
 
+    /// Subscribers to `stateStream`, keyed so a dropped subscriber's continuation
+    /// can be pruned individually (see `stateStream`'s `onTermination`).
+    /// `publish` fans a state change out to all of them.
     private var stateContinuations: [UUID: AsyncStream<GrooAuthState>.Continuation] = [:]
 
     public init(
@@ -231,9 +230,12 @@ public actor GrooAuthSession {
     /// comes back `401` despite `accessToken()` having handed out what looked
     /// like a still-valid token (e.g. the token was revoked server-side).
     /// Single-flight, same as `accessToken()`'s own refresh path. Throws
-    /// `.reauthRequired` if the refresh token itself is rejected (which also
-    /// publishes `.reauthRequired` on `stateStream`) or tokens are gone but the
-    /// identity is kept, and `.signedOut` if there's no session left at all.
+    /// If the refresh token itself is rejected, the error matches the resulting
+    /// state, which is also published on `stateStream`: `.reauthRequired` when
+    /// the identity is kept, `.signedOut` when the store keeps none, and the
+    /// issuer's original `.protocolError` when the store's `clear()` is a no-op
+    /// (the state is then still `.signedIn`). With no tokens left it throws
+    /// `.reauthRequired` if an identity is kept, else `.signedOut`.
     public func forceRefreshAccessToken() async throws -> String {
         try await refresh()
         guard let refreshed = try tokenStore.load() else {
@@ -1023,10 +1025,12 @@ public actor GrooAuthSession {
             let waiter = Task { _ = try? await inFlight.value; outcome.yield(true) }
             let wait = signOutRefreshWait
             let timer = Task { try? await Task.sleep(for: wait); outcome.yield(false) }
-            var finished = true
+            var finished: Bool?   // nil: the stream ended without an outcome (this task was cancelled)
             for await done in outcomes { finished = done; break }
             waiter.cancel(); timer.cancel()
-            if !finished {
+            if finished == nil {
+                GrooAuthLog.signin.notice("signOut: wait for in-flight refresh interrupted (task cancelled) — revoking the token we have")
+            } else if finished == false {
                 GrooAuthLog.signin.notice("signOut: in-flight refresh still running after \(String(describing: wait), privacy: .public) — revoking the token we have; the late refresh result will be discarded")
             }
         }

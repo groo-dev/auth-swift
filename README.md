@@ -328,7 +328,7 @@ shows its sign-in screen, exactly as before.
 
 | Token endpoint response | Error | State on refresh |
 |---|---|---|
-| 4xx with an OAuth error body (`invalid_grant`, `invalid_client`, ...) | `.protocolError` | Refresh refused: `.reauthRequired` (or `.signedOut` if no identity is known) |
+| 4xx with an OAuth error body (`invalid_grant`, `invalid_client`, ...) | `.protocolError` | Refresh refused: `.reauthRequired` when the identity is kept, `.signedOut` when the store keeps none, the original `.protocolError` when the store's `clear()` is a no-op (state stays `.signedIn`) |
 | 5xx, 408, 429 | `.transport` | Unchanged. Retry later. |
 | Anything else (e.g. a 4xx HTML error page, an unparseable body) | `.invalidResponse` | Unchanged |
 
