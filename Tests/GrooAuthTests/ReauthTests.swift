@@ -92,4 +92,102 @@ final class ReauthTests: XCTestCase {
         let state = await fresh.currentState()
         XCTAssertEqual(state, .reauthRequired(alice), "an app relaunch still knows who to ask")
     }
+
+    // MARK: - A refresh that outlives its session
+
+    func testSignOutDuringAFailingRefreshIsNotResurrectedAsReauth() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
+        let gate = transport.gate(tokenURL)
+        var states = await s.stateStream.makeAsyncIterator()
+        _ = await states.next() // .signedIn
+
+        let refresh = Task { try await s.accessToken() }
+        await gate.waitUntilHeld()
+        _ = await s.signOut()
+        gate.release()
+        do { _ = try await refresh.value; XCTFail("expected an error") } catch GrooAuthError.signedOut {}
+
+        XCTAssertNil(try store.loadIdentity(), "a signed-out person's identity must not be resurrected")
+        XCTAssertNil(try store.load())
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedOut)
+
+        _ = await s.signOut() // sentinel: anything the refresh published sits before this
+        let first = await states.next()
+        let second = await states.next()
+        XCTAssertEqual(first, .signedOut)
+        XCTAssertEqual(second, .signedOut, "no .reauthRequired after the .signedOut")
+    }
+
+    func testSignOutDuringASucceedingRefreshIsNotResurrectedAsSignedIn() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 200, tokenBody: #"{"access_token":"new","refresh_token":"r2","token_type":"Bearer","expires_in":900}"#)
+        let gate = transport.gate(tokenURL)
+
+        let refresh = Task { try await s.accessToken() }
+        await gate.waitUntilHeld()
+        _ = await s.signOut()
+        gate.release()
+        do { _ = try await refresh.value; XCTFail("expected an error") } catch GrooAuthError.signedOut {}
+
+        XCTAssertNil(try store.load(), "late refreshed tokens must not be saved over a sign-out")
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedOut)
+    }
+
+    func testConcurrentCallersDuringARejectedRefreshShareOneReauth() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
+        var states = await s.stateStream.makeAsyncIterator()
+        _ = await states.next()
+
+        let results = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<10 {
+                group.addTask {
+                    do { _ = try await s.accessToken(); return false } catch GrooAuthError.reauthRequired { return true } catch { return false }
+                }
+            }
+            var all: [Bool] = []
+            for await r in group { all.append(r) }
+            return all
+        }
+        XCTAssertEqual(results, Array(repeating: true, count: 10))
+        XCTAssertEqual(transport.callCount(for: tokenURL), 1)
+
+        _ = await s.signOut() // sentinel
+        var reauths = 0
+        while let next = await states.next(), next != .signedOut {
+            if next == .reauthRequired(alice) { reauths += 1 }
+        }
+        XCTAssertEqual(reauths, 1)
+    }
+
+    // MARK: - Stores that cannot keep an identity
+
+    /// Implements only the original three requirements: a real clear, no identity.
+    private final class NoIdentityStore: TokenStoring, @unchecked Sendable {
+        var tokens: StoredTokens?
+        func load() throws -> StoredTokens? { tokens }
+        func save(_ tokens: StoredTokens) throws { self.tokens = tokens }
+        func clear() throws { tokens = nil }
+    }
+
+    func testStoreWithoutIdentitySupportPublishesWhatItWillReport() async throws {
+        let store = NoIdentityStore()
+        try store.save(expired(user: alice))
+        let (s, _) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
+        var states = await s.stateStream.makeAsyncIterator()
+        _ = await states.next()
+
+        do { _ = try await s.accessToken(); XCTFail("expected reauthRequired") } catch GrooAuthError.reauthRequired {}
+
+        let published = await states.next()
+        let state = await s.currentState()
+        XCTAssertEqual(published, .signedOut)
+        XCTAssertEqual(state, .signedOut, "published and reported state agree")
+    }
 }

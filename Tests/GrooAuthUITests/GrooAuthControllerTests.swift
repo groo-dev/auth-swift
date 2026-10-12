@@ -96,6 +96,23 @@ final class GrooAuthControllerTests: XCTestCase {
         XCTAssertEqual(controller.user, alice)
     }
 
+    func testSigningOutFromReauthClearsTheFlagAndTheUser() async throws {
+        let alice = GrooUser(sub: "alice", email: "a@x.test", name: "Alice")
+        let store = InMemoryTokenStore()
+        try store.clearTokens(keeping: alice)
+        let session = makeSession(store: store)
+        let controller = GrooAuthController(session: session)
+        await controller.waitForFirstState()
+        XCTAssertTrue(controller.requiresReauth)
+
+        _ = await session.signOut()
+        for _ in 0..<200 where controller.requiresReauth { try await Task.sleep(nanoseconds: 10_000_000) }
+
+        XCTAssertFalse(controller.isSignedIn)
+        XCTAssertFalse(controller.requiresReauth)
+        XCTAssertNil(controller.user)
+    }
+
     func testASignedInControllerDoesNotRequireReauth() async {
         let controller = GrooAuthController(session: makeSession(storing: signedInTokens(sub: "u1", email: "a@b.test")))
         await controller.waitForFirstState()

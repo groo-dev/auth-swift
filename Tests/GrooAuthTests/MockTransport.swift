@@ -9,6 +9,27 @@ import Foundation
 ///
 /// Not thread-safe by design choice, but marked `@unchecked Sendable` since `HTTPTransporting`
 /// requires `Sendable` conformance and tests drive it from a single task/actor context.
+/// Test seam: holds a request to one URL until the test releases it, so a test
+/// can run other work (e.g. `signOut()`) while that request is in flight.
+final class RequestGate: @unchecked Sendable {
+    private let arrivedStream: AsyncStream<Void>
+    private let arrivedCont: AsyncStream<Void>.Continuation
+    private let releaseStream: AsyncStream<Void>
+    private let releaseCont: AsyncStream<Void>.Continuation
+    init() {
+        (arrivedStream, arrivedCont) = AsyncStream<Void>.makeStream()
+        (releaseStream, releaseCont) = AsyncStream<Void>.makeStream()
+    }
+    /// Called by the transport: announce arrival, then wait for `release()`.
+    func hold() async {
+        arrivedCont.yield()
+        for await _ in releaseStream { return }
+    }
+    /// Suspends until the gated request has reached the transport.
+    func waitUntilHeld() async { for await _ in arrivedStream { return } }
+    func release() { releaseCont.yield() }
+}
+
 final class MockTransport: HTTPTransporting, @unchecked Sendable {
     struct Response {
         let status: Int
@@ -30,6 +51,15 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
     /// second — without needing a full request-sequencing overhaul.
     private var sequences: [String: [Response]] = [:]
     private(set) var calls: [String] = []
+    private var gates: [String: RequestGate] = [:]
+    private let gateLock = NSLock()
+
+    /// Holds the next request to `urlString` until the returned gate is released.
+    func gate(_ urlString: String) -> RequestGate {
+        let g = RequestGate()
+        gateLock.withLock { gates[urlString] = g }
+        return g
+    }
     /// Last request body seen per URL (e.g. the form-encoded POST body), keyed the
     /// same way as `routes`/`calls`. Lets tests assert on what was actually sent
     /// (e.g. that a revoke POST carried the refresh token) without needing a
@@ -61,6 +91,8 @@ final class MockTransport: HTTPTransporting, @unchecked Sendable {
         if let body = request.httpBody {
             lastBodies[key] = body
         }
+        let held = gateLock.withLock { gates.removeValue(forKey: key) }
+        if let held { await held.hold() }
         let route: Response
         if var queued = sequences[key], !queued.isEmpty {
             route = queued.removeFirst()

@@ -118,15 +118,39 @@ public actor GrooAuthSession {
         if let tokens = (try? tokenStore.load()) ?? nil, let user = tokens.user {
             return .signedIn(user)
         }
-        if let kept = (try? tokenStore.loadIdentity()) ?? nil {
+        if let kept = keptIdentity() {
             return .reauthRequired(kept)
         }
         return .signedOut
     }
 
+    /// The identity kept across a refused refresh. A store that fails to read it
+    /// is treated as holding none (as `load()` failures are), but loudly.
+    private func keptIdentity() -> GrooUser? {
+        do {
+            return try tokenStore.loadIdentity()
+        } catch {
+            GrooAuthLog.token.error("loadIdentity failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    /// True when the stored refresh token is no longer the one this refresh was
+    /// started with: a sign-out or a new sign-in completed while the token
+    /// request was in flight, so its outcome describes a session that is gone and
+    /// must not be written back (it would resurrect a signed-out person).
+    private func sessionChanged(since tokens: StoredTokens) -> Bool {
+        let current = try? tokenStore.load()
+        if current?.refreshToken != tokens.refreshToken {
+            GrooAuthLog.signin.notice("performRefresh: session changed during refresh, result discarded")
+            return true
+        }
+        return false
+    }
+
     /// The error for "no tokens": reauth when an identity is kept, else signed out.
     private func noSessionError() -> GrooAuthError {
-        ((try? tokenStore.loadIdentity()) ?? nil) != nil ? .reauthRequired : .signedOut
+        keptIdentity() != nil ? .reauthRequired : .signedOut
     }
 
     /// Emits on every state change: `signIn` success and refresh success emit
@@ -239,6 +263,7 @@ public actor GrooAuthSession {
                 "refresh_token": tokens.refreshToken,
                 "client_id": config.clientId,
             ])
+            if sessionChanged(since: tokens) { return }
             let stored = StoredTokens(
                 accessToken: response.access_token,
                 refreshToken: response.refresh_token,
@@ -255,6 +280,7 @@ public actor GrooAuthSession {
             GrooAuthLog.signin.notice("performRefresh: done, outcome=success")
         } catch let error as GrooAuthError {
             if case .protocolError(let oauth) = error {
+                if sessionChanged(since: tokens) { throw noSessionError() }
                 // The issuer refused the refresh token. Nothing can renew it, but
                 // who signed in is still known: keep that, drop the tokens, and ask
                 // for a sign-in rather than forgetting the person and their data.
@@ -263,7 +289,7 @@ public actor GrooAuthSession {
                     do { try tokenStore.clear() } catch {
                         GrooAuthLog.token.error("performRefresh: clear failed: \(String(describing: error), privacy: .public)")
                     }
-                    publish(.signedOut)
+                    publish(computeCurrentState())
                     throw GrooAuthError.signedOut
                 }
                 do {
@@ -272,7 +298,9 @@ public actor GrooAuthSession {
                     GrooAuthLog.token.error("performRefresh: clearTokens(keeping:) failed: \(String(describing: error), privacy: .public)")
                 }
                 GrooAuthLog.signin.notice("performRefresh: refused (\(oauth.error, privacy: .public)), reauth required, identity kept")
-                publish(.reauthRequired(user))
+                // Publish what the store will actually report: a store that cannot
+                // keep the identity (or cannot clear) must not be contradicted.
+                publish(computeCurrentState())
                 throw GrooAuthError.reauthRequired
             }
             GrooAuthLog.signin.error("performRefresh: done, outcome=failed error=\(String(describing: error), privacy: .public)")
@@ -534,9 +562,8 @@ public actor GrooAuthSession {
         guard let relyingParty = config.issuer.host else {
             throw GrooAuthError.invalidResponse("issuer has no host to use as a relying party: \(config.issuer)")
         }
-        guard let tokens = try tokenStore.load(), let user = tokens.user else {
-            throw GrooAuthError.signedOut
-        }
+        guard let tokens = try tokenStore.load() else { throw noSessionError() }
+        guard let user = tokens.user else { throw GrooAuthError.signedOut }
 
         struct OptionsWire: Decodable {
             struct Options: Decodable {
