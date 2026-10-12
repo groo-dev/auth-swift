@@ -140,7 +140,15 @@ public actor GrooAuthSession {
     /// request was in flight, so its outcome describes a session that is gone and
     /// must not be written back (it would resurrect a signed-out person).
     private func sessionChanged(since tokens: StoredTokens) -> Bool {
-        let current = try? tokenStore.load()
+        let current: StoredTokens?
+        do {
+            current = try tokenStore.load()
+        } catch {
+            // Fail closed: if the store cannot be read, nothing is written back.
+            GrooAuthLog.token.error("could not re-read tokens after refresh: \(String(describing: error), privacy: .public)")
+            GrooAuthLog.signin.notice("performRefresh: session changed during refresh, result discarded")
+            return true
+        }
         if current?.refreshToken != tokens.refreshToken {
             GrooAuthLog.signin.notice("performRefresh: session changed during refresh, result discarded")
             return true
@@ -983,6 +991,10 @@ public actor GrooAuthSession {
     /// wants the cookie gone.
     public func signOut() async -> SignOutResult {
         GrooAuthLog.signin.notice("signOut: start")
+        // Let an in-flight refresh finish first. Otherwise it can rotate the
+        // refresh token while this awaits the revoke, and the token revoked here
+        // would be the stale one while the rotated one lives on server-side.
+        if let inFlight = refreshTask { _ = try? await inFlight.value }
         let loaded: StoredTokens?
         var revokeFailureReason: String?
         do {

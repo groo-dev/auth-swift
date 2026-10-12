@@ -95,7 +95,7 @@ final class ReauthTests: XCTestCase {
 
     // MARK: - A refresh that outlives its session
 
-    func testSignOutDuringAFailingRefreshIsNotResurrectedAsReauth() async throws {
+    func testASessionClearedDuringAFailingRefreshIsNotResurrectedAsReauth() async throws {
         let store = InMemoryTokenStore()
         try store.save(expired(user: alice))
         let (s, transport) = session(store, tokenStatus: 400, tokenBody: #"{"error":"invalid_grant"}"#)
@@ -105,7 +105,9 @@ final class ReauthTests: XCTestCase {
 
         let refresh = Task { try await s.accessToken() }
         await gate.waitUntilHeld()
-        _ = await s.signOut()
+        // signOut() now waits for the in-flight refresh, so the session is changed
+        // under it directly (what a concurrent signIn or another writer does).
+        try store.clear()
         gate.release()
         do { _ = try await refresh.value; XCTFail("expected an error") } catch GrooAuthError.signedOut {}
 
@@ -115,13 +117,11 @@ final class ReauthTests: XCTestCase {
         XCTAssertEqual(state, .signedOut)
 
         _ = await s.signOut() // sentinel: anything the refresh published sits before this
-        let first = await states.next()
-        let second = await states.next()
-        XCTAssertEqual(first, .signedOut)
-        XCTAssertEqual(second, .signedOut, "no .reauthRequired after the .signedOut")
+        let next = await states.next()
+        XCTAssertEqual(next, .signedOut, "the discarded refresh published nothing")
     }
 
-    func testSignOutDuringASucceedingRefreshIsNotResurrectedAsSignedIn() async throws {
+    func testASessionClearedDuringASucceedingRefreshIsNotResurrectedAsSignedIn() async throws {
         let store = InMemoryTokenStore()
         try store.save(expired(user: alice))
         let (s, transport) = session(store, tokenStatus: 200, tokenBody: #"{"access_token":"new","refresh_token":"r2","token_type":"Bearer","expires_in":900}"#)
@@ -129,11 +129,34 @@ final class ReauthTests: XCTestCase {
 
         let refresh = Task { try await s.accessToken() }
         await gate.waitUntilHeld()
-        _ = await s.signOut()
+        try store.clear()
         gate.release()
         do { _ = try await refresh.value; XCTFail("expected an error") } catch GrooAuthError.signedOut {}
 
         XCTAssertNil(try store.load(), "late refreshed tokens must not be saved over a sign-out")
+        let state = await s.currentState()
+        XCTAssertEqual(state, .signedOut)
+    }
+
+    func testSignOutDuringARefreshRevokesTheRotatedToken() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(expired(user: alice))
+        let (s, transport) = session(store, tokenStatus: 200, tokenBody: #"{"access_token":"new","refresh_token":"r2","token_type":"Bearer","expires_in":900}"#)
+        let gate = transport.gate(tokenURL)
+
+        let refresh = Task { try await s.accessToken() }
+        await gate.waitUntilHeld()
+        let signOut = Task { await s.signOut() }
+        // Give signOut a chance to run up to its wait on the in-flight refresh.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        gate.release()
+        _ = try? await refresh.value
+        _ = await signOut.value
+
+        let revokeURL = "https://accounts.groo.dev/v1/oauth/revoke"
+        let body = String(decoding: try XCTUnwrap(transport.lastRequestBody(for: revokeURL)), as: UTF8.self)
+        XCTAssertTrue(body.contains("token=r2"), "the live (rotated) token is revoked, got: \(body)")
+        XCTAssertNil(try store.load())
         let state = await s.currentState()
         XCTAssertEqual(state, .signedOut)
     }
