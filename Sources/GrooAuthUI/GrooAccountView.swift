@@ -13,6 +13,7 @@ public struct GrooAccountView: View {
     private let controller: GrooAuthController
     private let consoleURL: URL?
     private let sections: GrooAccountSections
+    private let onSignOut: (@MainActor () -> Void)?
 
     @Environment(\.grooAuthTheme) private var theme
     @Environment(\.dismiss) private var dismiss
@@ -36,14 +37,30 @@ public struct GrooAccountView: View {
     ///   whose issuer has no console should not offer a dead one.
     /// - Parameter sections: which security lists to show. Each costs a scope, so
     ///   this is the app's decision — see `GrooAccountSections.requiredScopes`.
+    /// - Parameter onSignOut: when set, Sign Out closes this screen and calls it
+    ///   instead of signing out. An app that must check something first (unsent
+    ///   offline changes) runs its own confirmation and then signs out itself.
+    ///   `nil` keeps the direct sign-out. Presented on its own, this view calls
+    ///   the hook straight away and then dismisses; `GrooUserButton` defers the
+    ///   call until its sheet has closed, so a confirmation the app shows can
+    ///   present.
     public init(
         controller: GrooAuthController,
         consoleURL: URL? = nil,
-        sections: GrooAccountSections = []
+        sections: GrooAccountSections = [],
+        onSignOut: (@MainActor () -> Void)? = nil
     ) {
         self.controller = controller
         self.consoleURL = consoleURL
         self.sections = sections
+        self.onSignOut = onSignOut
+    }
+
+    enum SignOutAction: Equatable {
+        case signOutDirectly, callHook
+        static func resolve(hook: (@MainActor () -> Void)?) -> SignOutAction {
+            hook == nil ? .signOutDirectly : .callHook
+        }
     }
 
     /// What a destructive row is asking to remove. One type for all four lists,
@@ -413,13 +430,21 @@ public struct GrooAccountView: View {
     }
 
     private func signOut() {
-        isSigningOut = true
-        Task {
-            // The result says whether the issuer was reached; this device is
-            // signed out either way, so the screen closes either way.
-            await controller.signOut()
-            isSigningOut = false
+        switch SignOutAction.resolve(hook: onSignOut) {
+        case .callHook:
+            // The app decides, after this sheet closes: a confirmation it shows can't present
+            // over it. Record the request before dismissing, so `onDismiss` sees it.
+            onSignOut?()
             dismiss()
+        case .signOutDirectly:
+            isSigningOut = true
+            Task {
+                // The result says whether the issuer was reached; this device is
+                // signed out either way, so the screen closes either way.
+                await controller.signOut()
+                isSigningOut = false
+                dismiss()
+            }
         }
     }
 
