@@ -53,9 +53,22 @@ public struct GrooUserButton: View {
     private let consoleURL: URL?
     private let sections: GrooAccountSections
     private let showsLabel: Bool
+    private let onSignOut: (@MainActor () -> Void)?
 
     @Environment(\.grooAuthTheme) private var theme
     @State private var isPresentingAccount = false
+
+    /// A sign-out the account screen asked for, run once its sheet has closed.
+    struct PendingSignOut {
+        private var requested = false
+        mutating func request() { requested = true }
+        mutating func sheetDismissed(_ run: () -> Void) {
+            guard requested else { return }
+            requested = false
+            run()
+        }
+    }
+    @State private var pendingSignOut = PendingSignOut()
 
     /// - Parameters:
     ///   - consoleURL: the hosted account page, passed through to
@@ -64,16 +77,22 @@ public struct GrooUserButton: View {
     ///     scope — see `GrooAccountSections.requiredScopes`.
     ///   - showsLabel: `true` renders name and email beside the avatar, for a
     ///     settings row; `false` is the bare circle for a toolbar.
+    ///   - onSignOut: when set, the account screen's Sign Out closes the sheet
+    ///     and then calls this, instead of signing out. The app runs its own
+    ///     check (unsent offline changes) and signs out itself. `nil` keeps the
+    ///     direct sign-out.
     public init(
         controller: GrooAuthController,
         consoleURL: URL? = nil,
         sections: GrooAccountSections = [],
-        showsLabel: Bool = false
+        showsLabel: Bool = false,
+        onSignOut: (@MainActor () -> Void)? = nil
     ) {
         self.controller = controller
         self.consoleURL = consoleURL
         self.sections = sections
         self.showsLabel = showsLabel
+        self.onSignOut = onSignOut
     }
 
     public var body: some View {
@@ -100,8 +119,11 @@ public struct GrooUserButton: View {
         }
         .accessibilityLabel("Account")
         .accessibilityIdentifier("grooUserButton")
-        .sheet(isPresented: $isPresentingAccount) {
-            GrooAccountView(controller: controller, consoleURL: consoleURL, sections: sections)
+        .sheet(isPresented: $isPresentingAccount, onDismiss: {
+            pendingSignOut.sheetDismissed { onSignOut?() }
+        }) {
+            GrooAccountView(controller: controller, consoleURL: consoleURL, sections: sections,
+                            onSignOut: onSignOut == nil ? nil : { pendingSignOut.request() })
                 .environment(\.grooAuthTheme, theme)
         }
     }

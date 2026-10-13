@@ -148,6 +148,14 @@ down as a literal — a hardcoded host would work for exactly one workspace.
 `GrooUserButton` opens `GrooAccountView`: who you are signed in as, an editable
 name and phone, a link to the hosted console, and sign-out.
 
+An app that must check something before signing out (unsent offline changes)
+passes `onSignOut:` to `GrooUserButton` or `GrooAccountView`. Sign Out then closes
+the screen and calls the hook instead of signing out; the app runs its own
+confirmation and calls `controller.signOut()` itself. Through `GrooUserButton` the
+hook runs after the sheet has gone, so a confirmation can present; a
+`GrooAccountView` presented on its own calls it straight away. Omit it and
+sign-out stays direct.
+
 ```swift
 GrooUserButton(
     controller: controller,
